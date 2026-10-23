@@ -45,11 +45,12 @@ jobs:
 
           cat > build.gradle <<'EOF'
           plugins {
-              id 'net.fabricmc.fabric-loom' version '1.14-SNAPSHOT'
+              id 'net.fabricmc.fabric-loom-remap' version '1.14-SNAPSHOT'
           }
 
           group = 'autosand'
           version = '1.0.0'
+
           base {
               archivesName = 'AutoSandOrders'
           }
