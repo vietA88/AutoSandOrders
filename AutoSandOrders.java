@@ -38,6 +38,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.text.Normalizer;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
@@ -241,6 +242,7 @@ public class AutoSandOrders implements ClientModInitializer {
             autoRevive = Boolean.parseBoolean(pr.getProperty("revive", "true"));
             avoidLiquid = Boolean.parseBoolean(pr.getProperty("avoidLiquid", "true"));
             avoidHole = Boolean.parseBoolean(pr.getProperty("avoidHole", "true"));
+            bridgeWater = Boolean.parseBoolean(pr.getProperty("bridge", "true"));
             ORDER_COMMAND = pr.getProperty("orderCmd", ORDER_COMMAND);
             SHOP_COMMAND = pr.getProperty("shopCmd", SHOP_COMMAND);
         } catch (Exception ignored) { }
@@ -264,6 +266,7 @@ public class AutoSandOrders implements ClientModInitializer {
             pr.setProperty("revive", String.valueOf(autoRevive));
             pr.setProperty("avoidLiquid", String.valueOf(avoidLiquid));
             pr.setProperty("avoidHole", String.valueOf(avoidHole));
+            pr.setProperty("bridge", String.valueOf(bridgeWater));
             pr.setProperty("orderCmd", ORDER_COMMAND);
             pr.setProperty("shopCmd", SHOP_COMMAND);
             try (var out = Files.newOutputStream(cfgFile())) { pr.store(out, "AutoSand"); }
@@ -310,7 +313,7 @@ public class AutoSandOrders implements ClientModInitializer {
     static void applyBaritoneSettings(LocalPlayer p) {
         if (mode != Mode.BARITONE || pickupRadius <= 0) return;
         send(p, "#set mineScanDroppedItems true");
-        int ms = pickupRadius >= 12 ? 1500 : pickupRadius >= 8 ? 900 : 500;
+        int ms = pickupRadius >= 12 ? 1000 : pickupRadius >= 8 ? 600 : 350;
         send(p, "#set mineDropLoiterDurationMSThanksLouca " + ms);
     }
 
@@ -1376,21 +1379,24 @@ public class AutoSandOrders implements ClientModInitializer {
     //  - SIDE:   thấy nước / lava / hố ngay phía trước -> dừng, quay sang hướng an toàn đi vài tick rồi đào tiếp.
     //  - Watchdog: đứng yên quá lâu thì gửi lại lệnh đào (phòng khi Baritone / Nuker tự dừng vì lý do khác).
     static final int HOLE_DEPTH = 3;          // chỗ trống phía trước sâu từ bấy nhiêu ô trở lên thì coi là hố
-    static final int TRAP_TICKS = 30;         // kẹt trong hố liên tục bấy nhiêu tick mới bắt đầu thoát
+    static final int TRAP_TICKS = 4;          // kẹt trong hố liên tục bấy nhiêu tick mới bắt đầu thoát
     static final int ESCAPE_MAX_PILLARS = 20; // tối đa số lần đặt block cho 1 lần thoát hố
     static final int GUARD_COOLDOWN = 60;     // nghỉ sau mỗi lần xử lý để không lặp liên tục
     static final int WATCHDOG_TICKS = 200;    // đứng yên bấy nhiêu tick (10 giây) thì gửi lại lệnh đào
     static final int SHORE_RADIUS = 10;       // bán kính tìm bờ khi đang ở dưới nước / lava
     static final int SIDE_TICKS = 14;         // số tick đi sang bên khi né
+    static final int BRIDGE_RADIUS = 16;      // tìm bờ để bắc cầu trong bán kính này
+    static final int BRIDGE_MAX = 40;         // tối đa số block đặt cho 1 lần bắc cầu
     static final int PICKUP_MAX_TICKS = 100;  // đi nhặt 1 món quá bấy nhiêu tick thì bỏ qua món đó
     static final int WD_STEP = 20;            // watchdog kiểm tra mỗi bấy nhiêu tick
-    static final int WD_IDLE_MIN = 60;        // đứng yên / không đào bấy nhiêu tick (3 giây) thì bật lại lệnh đào
+    static final int WD_IDLE_MIN = 100;       // đứng yên / không đào bấy nhiêu tick (3 giây) thì bật lại lệnh đào
     static final int WD_IDLE_MAX = 400;       // mỗi lần bật lại không ăn thua thì chờ lâu gấp đôi, tối đa bấy nhiêu
 
     static boolean avoidLiquid = true;        // né nước / lava + tự bơi lên bờ
     static boolean avoidHole = true;          // né hố + tự đặt block thoát hố
+    static boolean bridgeWater = true;        // bị nước bao quanh -> đặt block bắc cầu vào bờ
 
-    enum G { NONE, LIQUID, ESCAPE, SIDE, PICKUP }
+    enum G { NONE, LIQUID, ESCAPE, SIDE, PICKUP, BRIDGE }
 
     static G guard = G.NONE;
     static int guardCool = 0, guardTicks = 0, trapTicks = 0, wdTick = 0;
@@ -1400,9 +1406,12 @@ public class AutoSandOrders implements ClientModInitializer {
     static BlockPos escBase = null;
     static float escPitch = Float.NaN;
     static int sideTicks = 0, sideStrikes = 0, sideLock = 0, sideWindow = 0;
+    static BlockPos bridgeTarget = null;
+    static int bridgeCool = 0, brPlaced = 0, brCool = 0, surroundTicks = 0;
     static ItemEntity pickTarget = null;
     static int pickTicks = 0, pickCool = 0;
     static final Set<Integer> pickIgnore = new HashSet<>();
+    static int wetTicks = 0;
     static int wdIdle = 0, wdGap = WD_IDLE_MIN, wdFails = 0, wdSand = -1;
 
     static final Direction[] HORIZ = {Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST};
@@ -1432,11 +1441,27 @@ public class AutoSandOrders implements ClientModInitializer {
         return true;
     }
 
+    static boolean lavaAt(ClientLevel lv, BlockPos pos) {
+        return lv.getBlockState(pos).getFluidState().is(FluidTags.LAVA);
+    }
+
+    /** Nước sâu từ 2 ô trở lên (nước nông 1 ô thì đi bộ được, không tính). */
+    static boolean deepWater(ClientLevel lv, BlockPos a) {
+        return (liquidAt(lv, a) && liquidAt(lv, a.below()))
+            || (liquidAt(lv, a.below()) && liquidAt(lv, a.below(2)));
+    }
+
+    /** Đang ở chỗ nguy hiểm thật: trong lava, hoặc đang bơi / chìm trong nước sâu. Đứng trong nước nông thì không. */
+    static boolean danger(LocalPlayer p) {
+        if (p.isInLava()) return true;
+        return p.isInWater() && (p.isUnderWater() || !p.onGround());
+    }
+
     /** Đi theo hướng (dx, dz) từ (x, y, z), trong 2 ô tới có nước / lava / hố không. */
     static boolean hazardDir(ClientLevel lv, double x, double y, double z, double dx, double dz) {
         for (double k : new double[] {1.0, 1.8}) {
             BlockPos a = BlockPos.containing(x + dx * k, y + 0.1, z + dz * k);
-            if (avoidLiquid && (liquidAt(lv, a) || liquidAt(lv, a.below()))) return true;
+            if (avoidLiquid && (lavaAt(lv, a) || lavaAt(lv, a.below()) || deepWater(lv, a))) return true;
             if (avoidHole && passable(lv, a)) {
                 boolean drop = true;
                 for (int i = 1; i <= HOLE_DEPTH; i++) {
@@ -1460,7 +1485,7 @@ public class AutoSandOrders implements ClientModInitializer {
                 for (int dy = 2; dy >= -2; dy--) {
                     BlockPos f = o.offset(dx, dy, dz);
                     BlockPos g = f.below();
-                    if (liquidAt(lv, f) || liquidAt(lv, f.above()) || liquidAt(lv, g)) continue;
+                    if (lavaAt(lv, f) || lavaAt(lv, f.above()) || lavaAt(lv, g) || liquidAt(lv, f.above())) continue;
                     if (!passable(lv, f) || !passable(lv, f.above())) continue;
                     if (passable(lv, g)) continue;               // phải có nền để đứng
                     best = f;
@@ -1496,7 +1521,7 @@ public class AutoSandOrders implements ClientModInitializer {
     }
 
     static void guardReset(Minecraft mc, LocalPlayer p) {
-        if (guard == G.ESCAPE && p != null && mc.gameMode != null) {
+        if ((guard == G.ESCAPE || guard == G.BRIDGE) && p != null && mc.gameMode != null) {
             if (escSwapIdx >= 0) { swapHotbar(mc, p, escSwapIdx, escSlot); escSwapIdx = -1; }
             setSelected(p, escPrevSel);
             if (!Float.isNaN(escPitch)) { p.setXRot(escPitch); escPitch = Float.NaN; }
@@ -1518,6 +1543,7 @@ public class AutoSandOrders implements ClientModInitializer {
         releaseKeys(mc);
         guard = G.NONE;
         guardCool = GUARD_COOLDOWN;
+        wetTicks = 0;
         trapTicks = 0;
         wdTick = 0;
         wdX = Double.NaN;
@@ -1533,6 +1559,7 @@ public class AutoSandOrders implements ClientModInitializer {
         if (guard == G.ESCAPE) { tickEscape(mc, p, lv); return true; }
         if (guard == G.SIDE) { tickSide(mc, p, lv); return true; }
         if (guard == G.PICKUP) { tickPickup(mc, p, lv); return true; }
+        if (guard == G.BRIDGE) { tickBridge(mc, p, lv); return true; }
 
         if (guardCool > 0) guardCool--;
         if (pickCool > 0) pickCool--;
@@ -1540,17 +1567,25 @@ public class AutoSandOrders implements ClientModInitializer {
         if (sideWindow > 0 && --sideWindow == 0) sideStrikes = 0;
 
         // 1) rơi xuống nước / lava
-        if (avoidLiquid && (p.isInWater() || p.isInLava())) {
-            stopMining(mc, p);
-            guard = G.LIQUID;
-            guardTicks = 0;
-            shore = null;
-            msg(p, p.isInLava() ? "Đang ở trong lava -> tự thoát lên bờ." : "Rơi xuống nước -> tự bơi lên bờ.");
-            return true;
+        //    Baritone tự bơi được nên cho nó vài giây tự xoay xở trước; lava thì ra tay gần như ngay.
+        if (avoidLiquid && danger(p)) {
+            wetTicks++;
+            int need = p.isInLava() ? 3 : (mode == Mode.BARITONE ? 50 : 15);
+            if (wetTicks >= need) {
+                wetTicks = 0;
+                stopMining(mc, p);
+                guard = G.LIQUID;
+                guardTicks = 0;
+                shore = null;
+                msg(p, p.isInLava() ? "Đang ở trong lava -> tự thoát lên bờ." : "Kẹt trong nước sâu -> tự bơi lên bờ.");
+                return true;
+            }
+        } else {
+            wetTicks = 0;
         }
 
         // 2) kẹt trong hố -> đặt block leo lên
-        if (avoidHole && guardCool <= 0 && p.onGround() && trapped(lv, p.blockPosition())) {
+        if (avoidHole && p.onGround() && trapped(lv, p.blockPosition())) {
             if (++trapTicks >= TRAP_TICKS) {
                 trapTicks = 0;
                 if (startEscape(mc, p)) return true;
@@ -1559,8 +1594,19 @@ public class AutoSandOrders implements ClientModInitializer {
             trapTicks = 0;
         }
 
+        // 2b) bị nước bao quanh, không còn đường đi -> đặt block bắc cầu vào bờ
+        if (bridgeCool > 0) bridgeCool--;
+        if (avoidLiquid && bridgeWater && bridgeCool <= 0 && p.onGround() && surroundedByWater(lv, p.blockPosition())) {
+            if (++surroundTicks >= (mode == Mode.BARITONE ? 40 : 20)) {
+                surroundTicks = 0;
+                if (startBridge(mc, p)) return true;
+            }
+        } else {
+            surroundTicks = 0;
+        }
+
         // 3) nước / lava / hố ngay phía trước -> né sang bên
-        if ((avoidLiquid || avoidHole) && guardCool <= 0 && sideLock <= 0 && p.onGround()) {
+        if (mode != Mode.BARITONE && (avoidLiquid || avoidHole) && guardCool <= 0 && sideLock <= 0 && p.onGround()) {
             var v = p.getDeltaMovement();
             double h = Math.hypot(v.x, v.z);
             if (h > 0.08 && hazardDir(lv, p.getX(), p.getY(), p.getZ(), v.x / h, v.z / h)) {
@@ -1570,7 +1616,7 @@ public class AutoSandOrders implements ClientModInitializer {
         }
 
         // 4) ưu tiên nhặt cát đang rơi gần đó
-        if (pickupRadius > 0 && pickCool <= 0 && guardCool <= 0 && p.onGround() && !isFull(p)) {
+        if (mode != Mode.BARITONE && pickupRadius > 0 && pickCool <= 0 && guardCool <= 0 && p.onGround() && !isFull(p)) {
             ItemEntity it = nearestSand(lv, p);
             if (it != null) { startPickup(mc, p, it); return true; }
         }
@@ -1604,6 +1650,154 @@ public class AutoSandOrders implements ClientModInitializer {
             }
         }
         return false;
+    }
+
+    // ----- BRIDGE (bắc cầu qua nước) -----
+    static boolean walkable(ClientLevel lv, BlockPos n) {
+        return passable(lv, n) && passable(lv, n.above()) && !passable(lv, n.below());
+    }
+
+    /** Bị nước bao quanh: cả 4 phía đều không đi bộ / bước lên được và ít nhất 1 phía là nước sâu. */
+    static boolean surroundedByWater(ClientLevel lv, BlockPos f) {
+        boolean deep = false;
+        for (Direction d : HORIZ) {
+            BlockPos n = f.relative(d);
+            if (walkable(lv, n)) return false;
+            if (!passable(lv, n) && passable(lv, n.above()) && passable(lv, n.above(2))) return false; // bước lên được
+            if (deepWater(lv, n)) deep = true;
+        }
+        return deep;
+    }
+
+    /** Bờ khô gần nhất (cách ít nhất 3 ô) và là vùng đất rộng, không phải cột đá nhỏ giữa nước. */
+    static BlockPos findDry(ClientLevel lv, LocalPlayer p, int radius) {
+        BlockPos o = p.blockPosition();
+        BlockPos best = null;
+        double bestD = Double.MAX_VALUE;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                double d = dx * dx + dz * dz;
+                if (d < 9 || d >= bestD) continue;
+                for (int dy = 2; dy >= -2; dy--) {
+                    BlockPos f = o.offset(dx, dy, dz);
+                    if (!walkable(lv, f) || liquidAt(lv, f) || liquidAt(lv, f.above())) continue;
+                    int land = 0;
+                    for (Direction h : HORIZ) {
+                        BlockPos n = f.relative(h);
+                        if (walkable(lv, n) && !liquidAt(lv, n)) land++;
+                    }
+                    if (land < 3) continue;
+                    best = f;
+                    bestD = d;
+                    break;
+                }
+            }
+        }
+        return best;
+    }
+
+    static boolean startBridge(Minecraft mc, LocalPlayer p) {
+        ClientLevel lv = mc.level;
+        if (lv == null) return false;
+        BlockPos t = findDry(lv, p, BRIDGE_RADIUS);
+        if (t == null) {
+            msg(p, "Bị nước bao quanh nhưng không thấy bờ trong " + BRIDGE_RADIUS + " ô.");
+            bridgeCool = 400;
+            return false;
+        }
+        int slot = hotbarPlaceSlot(p);
+        int swapped = -1;
+        if (slot < 0) {
+            int idx = findPlaceable(p);
+            if (idx < 0) {
+                msg(p, "Bị nước bao quanh nhưng không có block để bắc cầu.");
+                bridgeCool = 400;
+                return false;
+            }
+            slot = toHotbar(mc, p, idx);
+            swapped = idx;
+        }
+        stopMining(mc, p);
+        bridgeTarget = t;
+        escSlot = slot;
+        escSwapIdx = swapped;
+        escPrevSel = getSelected(p);
+        escPitch = p.getXRot();
+        setSelected(p, slot);
+        brPlaced = 0;
+        brCool = 0;
+        guardTicks = 0;
+        guard = G.BRIDGE;
+        msg(p, "Bị nước bao quanh -> đặt block bắc cầu vào bờ.");
+        return true;
+    }
+
+    static void tickBridge(Minecraft mc, LocalPlayer p, ClientLevel lv) {
+        guardTicks++;
+        setSelected(p, escSlot);
+        if (bridgeTarget == null) { finishBridge(mc, p, "mất mục tiêu", 200); return; }
+        double dx = bridgeTarget.getX() + 0.5 - p.getX(), dz = bridgeTarget.getZ() + 0.5 - p.getZ();
+        if (Math.hypot(dx, dz) < 1.2 && p.onGround() && !danger(p)) { finishBridge(mc, p, null, 100); return; }
+        if (guardTicks > 800 || brPlaced >= BRIDGE_MAX) { finishBridge(mc, p, "chưa tới được bờ sau " + brPlaced + " block", 400); return; }
+        if (p.isInLava()) { finishBridge(mc, p, "đang ở trong lava", 400); return; }
+        if (guardTicks % 40 == 0) {
+            BlockPos nt = findDry(lv, p, BRIDGE_RADIUS);
+            if (nt != null) bridgeTarget = nt;
+        }
+
+        Direction dir = Math.abs(dx) >= Math.abs(dz)
+            ? (dx > 0 ? Direction.EAST : Direction.WEST)
+            : (dz > 0 ? Direction.SOUTH : Direction.NORTH);
+        p.setYRot(dir.toYRot());
+        p.setXRot(60f);
+        BlockPos feet = p.blockPosition();
+        BlockPos f = feet.relative(dir), b = f.below();
+        if (lavaAt(lv, f) || lavaAt(lv, b)) { finishBridge(mc, p, "có lava phía trước", 400); return; }
+
+        mc.options.keyJump.setDown(p.isInWater() && !p.onGround());     // đang bơi thì giữ nhảy để nổi
+        if (!passable(lv, b) && passable(lv, f) && passable(lv, f.above())) {   // phía trước đã có nền -> đi tới
+            mc.options.keyUp.setDown(true);
+            return;
+        }
+        if (!passable(lv, f)) {                                          // gặp vách / bậc -> đi tới và nhảy
+            mc.options.keyUp.setDown(true);
+            mc.options.keyJump.setDown(true);
+            return;
+        }
+        mc.options.keyUp.setDown(false);                                 // đứng yên đặt block
+        if (brCool > 0) { brCool--; return; }
+
+        // Đặt block vào ô nền phía trước (b). Ưu tiên đặt vào mặt bên của block đang đứng.
+        BlockPos u = feet.below();
+        BlockHitResult hit = null;
+        if (!passable(lv, u)) {
+            hit = new BlockHitResult(Vec3.atCenterOf(u).add(dir.getStepX() * 0.5, 0, dir.getStepZ() * 0.5), dir, u, false);
+        } else {
+            // đang bơi, chưa có nền dưới chân: đặt vào ô dưới chân, dựa vào block rắn bên cạnh nếu có
+            for (Direction d : HORIZ) {
+                BlockPos n = u.relative(d);
+                if (!passable(lv, n)) {
+                    hit = new BlockHitResult(Vec3.atCenterOf(n).add(-d.getStepX() * 0.5, 0, -d.getStepZ() * 0.5), d.getOpposite(), n, false);
+                    break;
+                }
+            }
+            if (hit == null) hit = new BlockHitResult(Vec3.atCenterOf(u), Direction.UP, u, false);
+        }
+        mc.gameMode.useItemOn(p, InteractionHand.MAIN_HAND, hit);
+        p.swing(InteractionHand.MAIN_HAND);
+        brPlaced++;
+        brCool = 3;
+    }
+
+    static void finishBridge(Minecraft mc, LocalPlayer p, String err, int cool) {
+        mc.options.keyJump.setDown(false);
+        if (escSwapIdx >= 0) { swapHotbar(mc, p, escSwapIdx, escSlot); escSwapIdx = -1; }
+        setSelected(p, escPrevSel);
+        if (!Float.isNaN(escPitch)) { p.setXRot(escPitch); escPitch = Float.NaN; }
+        bridgeTarget = null;
+        bridgeCool = cool;
+        msg(p, err == null ? "Đã bắc cầu vào bờ (" + brPlaced + " block)." : "Bắc cầu dừng: " + err);
+        endGuard(mc, p);
     }
 
     // ----- PICKUP (ưu tiên nhặt cát) -----
@@ -1664,8 +1858,7 @@ public class AutoSandOrders implements ClientModInitializer {
     // ----- LIQUID -----
     static void tickLiquid(Minecraft mc, LocalPlayer p, ClientLevel lv) {
         guardTicks++;
-        boolean wet = p.isInWater() || p.isInLava();
-        if (!wet && p.onGround()) {
+        if (!danger(p) && p.onGround()) {
             msg(p, "Đã lên bờ, đào tiếp.");
             endGuard(mc, p);
             return;
@@ -1675,6 +1868,11 @@ public class AutoSandOrders implements ClientModInitializer {
             endGuard(mc, p);
             return;
         }
+        if (bridgeWater && guardTicks >= 60 && bridgeCool <= 0 && !p.isInLava()) {
+            mc.options.keyJump.setDown(false);
+            releaseKeys(mc);
+            if (startBridge(mc, p)) return;                      // bơi 3 giây chưa lên được -> đặt block bắc cầu
+        }
         if (shore == null || guardTicks % 10 == 1) shore = findShore(lv, p);
         mc.options.keyJump.setDown(true);                        // nhấn nhảy = bơi lên mặt nước / lava
         if (shore != null) {
@@ -1682,6 +1880,8 @@ public class AutoSandOrders implements ClientModInitializer {
             p.setYRot((float) Math.toDegrees(Math.atan2(-dx, dz)));
             p.setXRot(0f);
             mc.options.keyUp.setDown(true);
+        } else {
+            mc.options.keyUp.setDown(true);                      // không thấy bờ trong bán kính -> cứ bơi thẳng
         }
     }
 
@@ -1819,6 +2019,7 @@ public class AutoSandOrders implements ClientModInitializer {
                 case ESCAPE -> "Đang đặt block leo khỏi hố";
                 case SIDE -> "Đang né nguy hiểm";
                 case PICKUP -> "Đang đi nhặt cát";
+                case BRIDGE -> "Đang bắc cầu qua nước";
                 default -> "Đang đào cát";
             };
         }
@@ -1844,204 +2045,328 @@ public class AutoSandOrders implements ClientModInitializer {
         return best > 100 ? -1 : (int) Math.round(best);
     }
 
-    static class AutoSandScreen extends Screen {
-        static final int PW = 340;                 // chiều rộng bảng
-        static final int COL_W = (PW - 20 - 8) / 2; // chiều rộng 1 cột nút
-        static final int ROW_H = 24;
-        static final String[] TABS = {"Chính", "Đào cát", "Sinh tồn", "An toàn", "Key"};
+    // ============================== GUI BÓNG BẨY ==============================
+    static int lerpC(int a, int b, float t) {
+        t = Math.max(0f, Math.min(1f, t));
+        int r = 0;
+        for (int s = 24; s >= 0; s -= 8) {
+            int ca = (a >> s) & 255, cb = (b >> s) & 255;
+            r |= (((int) (ca + (cb - ca) * t)) & 255) << s;
+        }
+        return r;
+    }
 
-        int tab = 0;
-        int x0, y0, ph, cx, cy;
+    /** Hình chữ nhật bo góc. */
+    static void rrect(GuiGraphics g, int x, int y, int w, int h, int r, int c) {
+        r = Math.min(r, Math.min(w, h) / 2);
+        if (r <= 0) { g.fill(x, y, x + w, y + h, c); return; }
+        g.fill(x, y + r, x + w, y + h - r, c);
+        for (int i = 0; i < r; i++) {
+            double dy = r - i - 0.5;
+            int dx = r - (int) Math.round(Math.sqrt(r * r - dy * dy));
+            g.fill(x + dx, y + i, x + w - dx, y + i + 1, c);
+            g.fill(x + dx, y + h - i - 1, x + w - dx, y + h - i, c);
+        }
+    }
+
+    static class AutoSandScreen extends Screen {
+        static final int PW = 392, SIDE = 94;
+        static final String[] TABS = {"Chính", "Đào cát", "Sinh tồn", "An toàn", "Key"};
+        static final int[] TAB_COL = {0xFF3B82F6, 0xFFF59E0B, 0xFF22C55E, 0xFFEF4444, 0xFFA855F7};
+        static final int TXT = 0xFFFFFFFF, MUTED = 0xFF8A94A6;
+
+        /** Một điều khiển tự vẽ (nút thật của game nằm bên dưới, trong suốt, chỉ để nhận chuột). */
+        static final class Ctl {
+            int kind, x, y, w, h, color;        // 0 công tắc, 1 chọn giá trị, 2 nút thường, 3 nút nguồn, 4 tab, 5 đóng
+            String title, desc;
+            BooleanSupplier on;
+            Supplier<String> value;
+            float t = -1f;
+            boolean selected;
+        }
+
+        final List<Ctl> ctls = new ArrayList<>();
+        int tab = 0, x0, y0, ph, cx, cy, cw, availH, rowH = 30;
 
         AutoSandScreen() {
             super(Component.literal("AutoSand"));
         }
 
-        int colX(int i) { return cx + (i % 2) * (COL_W + 8); }
-        int rowY(int i) { return cy + (i / 2) * ROW_H; }
-
-        void toggle(int i, String name, String tip, BooleanSupplier get, Consumer<Boolean> set) {
-            addRenderableWidget(Button.builder(onOff(name, get.getAsBoolean()), b -> {
-                set.accept(!get.getAsBoolean());
-                save();
-                b.setMessage(onOff(name, get.getAsBoolean()));
-            }).bounds(colX(i), rowY(i), COL_W, 20).tooltip(Tooltip.create(Component.literal(tip))).build());
+        Ctl add(int kind, int x, int y, int w, int h, String title, String desc, Runnable act) {
+            Ctl c = new Ctl();
+            c.kind = kind; c.x = x; c.y = y; c.w = w; c.h = h; c.title = title; c.desc = desc;
+            Button b = Button.builder(Component.empty(), bb -> act.run()).bounds(x, y, w, h).build();
+            b.setAlpha(0f);                      // trong suốt: hình vẽ do renderBackground lo
+            addRenderableWidget(b);
+            ctls.add(c);
+            return c;
         }
 
-        void cycle(int i, Supplier<Component> label, String tip, Runnable next) {
-            addRenderableWidget(Button.builder(label.get(), b -> {
-                next.run();
-                save();
-                b.setMessage(label.get());
-            }).bounds(colX(i), rowY(i), COL_W, 20).tooltip(Tooltip.create(Component.literal(tip))).build());
+        void begin(int n) {
+            rowH = Math.max(20, Math.min(30, (availH - (n - 1) * 4) / n));
+        }
+
+        int cardY(int i) { return cy + i * (rowH + 4); }
+
+        void toggle(int i, String title, String desc, BooleanSupplier get, Consumer<Boolean> set) {
+            Ctl c = add(0, cx, cardY(i), cw, rowH, title, desc, () -> { set.accept(!get.getAsBoolean()); save(); });
+            c.on = get;
+        }
+
+        void cycle(int i, String title, String desc, Supplier<String> value, Runnable next) {
+            Ctl c = add(1, cx, cardY(i), cw, rowH, title, desc, () -> { next.run(); save(); });
+            c.value = value;
         }
 
         @Override
         protected void init() {
-            ph = Math.min(this.height - 8, 236);
+            ctls.clear();
+            ph = Math.min(this.height - 8, 262);
             x0 = this.width / 2 - PW / 2;
             y0 = this.height / 2 - ph / 2;
-            cx = x0 + 10;
-            cy = y0 + 58;
+            cx = x0 + SIDE + 10;
+            cw = PW - SIDE - 20;
+            cy = y0 + 44;
+            availH = ph - 44 - 10;
 
-            // ----- thanh tab -----
-            int tw = (PW - 12 - 4 * 3) / 5;
             for (int i = 0; i < TABS.length; i++) {
                 final int t = i;
-                Component label = Component.literal(TABS[i]);
-                if (i == tab) label = Component.literal(TABS[i]).withStyle(ChatFormatting.YELLOW, ChatFormatting.BOLD);
-                addRenderableWidget(Button.builder(label, b -> {
-                    tab = t;
-                    rebuildWidgets();
-                }).bounds(x0 + 6 + i * (tw + 3), y0 + 30, tw, 18).build());
+                Ctl c = add(4, x0 + 8, y0 + 44 + i * 28, SIDE - 14, 24, TABS[i], null, () -> { tab = t; rebuildWidgets(); });
+                c.selected = (i == tab);
+                c.color = TAB_COL[i];
             }
+            add(5, x0 + PW - 26, y0 + 9, 16, 16, "x", null, () -> onClose());
 
             switch (tab) {
-                case 0 -> initMain();
-                case 1 -> initMining();
-                case 2 -> initSurvival();
-                case 3 -> initSafety();
-                default -> initKey();
+                case 0 -> add(3, cx, cy, cw, 36, "", null, () -> setEnabled(Minecraft.getInstance(), !enabled));
+                case 1 -> {
+                    begin(6);
+                    cycle(0, "Chế độ đào", "Baritone, giữ phím hoặc chỉ Nuker", () -> mode.label, () -> {
+                        Minecraft mc = Minecraft.getInstance();
+                        boolean running = enabled && state == S.MINING && mc.player != null;
+                        if (running) stopMining(mc, mc.player);
+                        mode = mode.next();
+                        if (running) startMining(mc.player);
+                    });
+                    toggle(1, "Nuker", "Phá khối xung quanh bằng Nuker", () -> useNuker, v -> {
+                        Minecraft mc = Minecraft.getInstance();
+                        useNuker = v;
+                        if (enabled && state == S.MINING && mc.player != null) send(mc.player, useNuker ? NUKER_ON : NUKER_OFF);
+                    });
+                    toggle(2, "Giữ phím tiến", "Chế độ Giữ phím: tự giữ W đi tới", () -> keysForward, v -> keysForward = v);
+                    cycle(3, "Nhặt cát", "Ưu tiên nhặt cát rơi quanh bạn", AutoSandOrders::pickupLabel, () -> {
+                        int next = PICKUP_LEVELS[0];
+                        for (int v : PICKUP_LEVELS) {
+                            if (v > pickupRadius) { next = v; break; }
+                        }
+                        pickupRadius = next;
+                        Minecraft mc = Minecraft.getInstance();
+                        if (mc.player != null && enabled) applyBaritoneSettings(mc.player);
+                    });
+                    toggle(4, "Tự giao cát", "Đầy túi -> /orders -> giao vào đơn cát", () -> autoDeliver, v -> autoDeliver = v);
+                    toggle(5, "Tự bật lại khi dừng", "Baritone / Nuker dừng hoặc lỗi -> bật lại", () -> autoRevive, v -> autoRevive = v);
+                }
+                case 2 -> {
+                    begin(7);
+                    toggle(0, "Tự ăn khi đói", "Đói -> ngừng đào, ăn no rồi đào tiếp", () -> autoEat, v -> autoEat = v);
+                    cycle(1, "Ăn khi đói <=", "Thanh đói từ mức này trở xuống thì ăn", () -> eatBelow + "/20", () -> {
+                        int next = EAT_LEVELS[0];
+                        for (int v : EAT_LEVELS) {
+                            if (v > eatBelow) { next = v; break; }
+                        }
+                        eatBelow = next;
+                    });
+                    toggle(2, "Tự mua đồ ăn", "Hết đồ ăn -> /shop -> FOOD -> Cà Rốt Vàng", () -> autoBuyFood, v -> { autoBuyFood = v; foodBuyFails = 0; });
+                    toggle(3, "Tự sửa xẻng", "Xẻng gần hư -> ném bình XP (cần Mending)", () -> autoMend, v -> autoMend = v);
+                    cycle(4, "Sửa khi còn dưới", "Độ bền xẻng thấp hơn mức này thì sửa", () -> mendPct + "%", () -> {
+                        int next = PCTS[0];
+                        for (int v : PCTS) {
+                            if (v > mendPct) { next = v; break; }
+                        }
+                        mendPct = next;
+                    });
+                    toggle(5, "Tự mua bình XP", "Hết bình XP -> mua ở /shop (chỉ vứt cát)", () -> autoBuy, v -> autoBuy = v);
+                    toggle(6, "Vứt đồ không cần", "Giữ cát, bình XP, xẻng, đồ ăn. Vứt phần còn lại", () -> autoDrop, v -> autoDrop = v);
+                }
+                case 3 -> {
+                    begin(3);
+                    toggle(0, "Thoát nước sâu / lava", "Kẹt nước sâu hoặc lava -> tự bơi lên bờ", () -> avoidLiquid, v -> avoidLiquid = v);
+                    toggle(1, "Bắc cầu qua nước", "Bị nước bao quanh -> đặt block đi vào bờ", () -> bridgeWater, v -> bridgeWater = v);
+                    toggle(2, "Né hố & tự leo", "Rơi xuống hố -> tự đặt block leo lên", () -> avoidHole, v -> avoidHole = v);
+                }
+                default -> add(2, cx, cy + 40, cw, 28, "Dán key từ clipboard", null, () -> {
+                    Minecraft mc = Minecraft.getInstance();
+                    activateKey(mc, mc.keyboardHandler.getClipboard());
+                });
             }
-
-            addRenderableWidget(Button.builder(Component.literal("Đóng"), b -> onClose())
-                .bounds(x0 + PW / 2 - 45, y0 + ph - 26, 90, 20).build());
         }
 
-        void initMain() {
-            Button big = Button.builder(onOff("AutoSand", enabled), b -> {
-                setEnabled(Minecraft.getInstance(), !enabled);
-                b.setMessage(onOff("AutoSand", enabled));
-            }).bounds(cx, cy, PW - 20, 24)
-                .tooltip(Tooltip.create(Component.literal("Bật / tắt toàn bộ AutoSand (cũng có thể dùng lệnh /autosand toggle)")))
-                .build();
-            addRenderableWidget(big);
+        void stat(GuiGraphics g, int x, int y, int w, int h, String label, String value, int vcol, float bar, int barCol) {
+            rrect(g, x, y, w, h, 4, 0xFF252F45);
+            rrect(g, x + 1, y + 1, w - 2, h - 2, 3, 0xFF182032);
+            g.drawString(this.font, label, x + 8, y + 5, MUTED, false);
+            g.drawString(this.font, value, x + 8, y + 16, vcol, false);
+            if (bar >= 0f) {
+                rrect(g, x + 8, y + h - 7, w - 16, 3, 1, 0xFF2A3347);
+                rrect(g, x + 8, y + h - 7, Math.max(2, (int) ((w - 16) * Math.min(1f, bar))), 3, 1, barCol);
+            }
         }
 
-        void initMining() {
-            cycle(0, () -> val("Chế độ đào", mode.label),
-                "Baritone: tự tìm và đào cát.\nGiữ phím: giữ chuột trái + đi tới.\nChỉ Nuker: chỉ dùng Nuker của client.",
-                () -> {
-                    Minecraft mc = Minecraft.getInstance();
-                    boolean running = enabled && state == S.MINING && mc.player != null;
-                    if (running) stopMining(mc, mc.player);
-                    mode = mode.next();
-                    if (running) startMining(mc.player);
-                });
-            toggle(1, "Nuker", "Dùng Nuker (.toggle nuker) để đào khối xung quanh.", () -> useNuker, v -> {
-                Minecraft mc = Minecraft.getInstance();
-                useNuker = v;
-                if (enabled && state == S.MINING && mc.player != null) send(mc.player, useNuker ? NUKER_ON : NUKER_OFF);
-            });
-            toggle(2, "Giữ phím tiến", "Chỉ dùng ở chế độ Giữ phím: tự giữ phím W đi tới.", () -> keysForward, v -> keysForward = v);
-            cycle(3, () -> val("Nhặt cát", pickupLabel()),
-                "Ưu tiên đi nhặt cát đang rơi trong bán kính này trước khi đào tiếp.\nCàng xa càng ưu tiên nhặt nhiều, nhưng đào chậm hơn một chút.",
-                () -> {
-                    int next = PICKUP_LEVELS[0];
-                    for (int v : PICKUP_LEVELS) {
-                        if (v > pickupRadius) { next = v; break; }
-                    }
-                    pickupRadius = next;
-                    Minecraft mc = Minecraft.getInstance();
-                    if (mc.player != null && enabled) applyBaritoneSettings(mc.player);
-                });
-            toggle(4, "Tự giao cát", "Túi đầy cát -> tự mở /orders và giao vào đơn cát.", () -> autoDeliver, v -> autoDeliver = v);
-            toggle(5, "Tự bật lại khi dừng", "Baritone / Nuker tự tắt hoặc báo lỗi -> tự bật lại lệnh đào.\nChết rồi hồi sinh cũng tự đào tiếp.", () -> autoRevive, v -> autoRevive = v);
+        void bullet(GuiGraphics g, String s, int x, int y) {
+            g.fill(x, y + 3, x + 3, y + 6, 0xFF3B82F6);
+            g.drawString(this.font, s, x + 8, y, 0xFFB6C0D0, false);
         }
 
-        void initSurvival() {
-            toggle(0, "Tự ăn khi đói", "Thanh đói thấp -> dừng đào, ăn cho no rồi đào tiếp.", () -> autoEat, v -> autoEat = v);
-            cycle(1, () -> val("Ăn khi đói <=", eatBelow + "/20"),
-                "Thanh đói từ mức này trở xuống thì bắt đầu ăn.",
-                () -> {
-                    int next = EAT_LEVELS[0];
-                    for (int v : EAT_LEVELS) {
-                        if (v > eatBelow) { next = v; break; }
-                    }
-                    eatBelow = next;
-                });
-            toggle(2, "Tự mua đồ ăn", "Hết đồ ăn -> /shop -> FOOD -> Cà Rốt Vàng.", () -> autoBuyFood, v -> { autoBuyFood = v; foodBuyFails = 0; });
-            toggle(3, "Tự sửa xẻng", "Xẻng gần hư -> ném bình XP để sửa (xẻng cần có Mending).", () -> autoMend, v -> autoMend = v);
-            cycle(4, () -> val("Sửa khi còn dưới", mendPct + "%"),
-                "Xẻng còn dưới mức % độ bền này thì bắt đầu sửa.",
-                () -> {
-                    int next = PCTS[0];
-                    for (int v : PCTS) {
-                        if (v > mendPct) { next = v; break; }
-                    }
-                    mendPct = next;
-                });
-            toggle(5, "Tự mua bình XP", "Hết bình XP -> vứt cát trên thanh công cụ rồi mua bình XP ở /shop.", () -> autoBuy, v -> autoBuy = v);
-            toggle(6, "Vứt đồ không cần", "Chỉ vứt đồ trong túi (không phải thanh công cụ).\nLuôn giữ: cát, bình XP, xẻng, đồ ăn.", () -> autoDrop, v -> autoDrop = v);
-        }
-
-        void initSafety() {
-            toggle(0, "Né nước / lava", "Thấy nước / lava phía trước thì rẽ sang bên.\nLỡ rơi xuống thì tự bơi lên bờ.", () -> avoidLiquid, v -> avoidLiquid = v);
-            toggle(1, "Né hố & tự leo", "Thấy hố sâu phía trước thì rẽ sang bên.\nLỡ rơi xuống hố thì tự đặt block (ưu tiên cát) để leo lên.", () -> avoidHole, v -> avoidHole = v);
-        }
-
-        void initKey() {
-            addRenderableWidget(Button.builder(Component.literal("Dán key từ clipboard để kích hoạt"), b -> {
-                Minecraft mc = Minecraft.getInstance();
-                activateKey(mc, mc.keyboardHandler.getClipboard());
-                rebuildWidgets();
-            }).bounds(cx, cy + 40, PW - 20, 22).build());
-        }
-
-        // ----- vẽ nền, tiêu đề, thông tin (các nút được vẽ đè lên trên) -----
         @Override
         public void renderBackground(GuiGraphics g, int mx, int my, float pt) {
             super.renderBackground(g, mx, my, pt);
+            g.fillGradient(0, 0, this.width, this.height, 0x66050A18, 0xAA0A1030);
 
-            g.fill(x0 - 2, y0 - 2, x0 + PW + 2, y0 + ph + 2, 0xFF2F6FED);    // viền
-            g.fill(x0, y0, x0 + PW, y0 + ph, 0xF0101620);                    // nền bảng
-            g.fill(x0, y0, x0 + PW, y0 + 26, 0xFF18202D);                    // thanh tiêu đề
-            g.fill(x0, y0 + 26, x0 + PW, y0 + 27, 0xFF2F6FED);
+            // ----- bóng đổ + khung bảng -----
+            for (int i = 6; i >= 1; i--) {
+                rrect(g, x0 - i, y0 - i, PW + 2 * i, ph + 2 * i, 8 + i, ((0x1C - i * 3) << 24) | 0x3B5BDB);
+            }
+            rrect(g, x0, y0, PW, ph, 8, 0xFF3B5BDB);
+            rrect(g, x0 + 1, y0 + 1, PW - 2, ph - 2, 7, 0xFF0F1420);
+            g.fillGradient(x0 + 4, y0 + 1, x0 + PW - 4, y0 + 34, 0xFF222E4C, 0xFF141B2D);       // thanh tiêu đề
+            g.fillGradient(x0 + 8, y0 + 35, x0 + PW - 8, y0 + 36 + (ph - 40) / 3, 0x12FFFFFF, 0x00FFFFFF); // ánh bóng
+            for (int i = 0; i < 48; i++) {                                                         // vạch màu dưới tiêu đề
+                g.fill(x0 + 6 + i * (PW - 12) / 48, y0 + 34, x0 + 6 + (i + 1) * (PW - 12) / 48, y0 + 36,
+                    lerpC(0xFF38BDF8, 0xFFC084FC, i / 47f));
+            }
+            g.fill(x0 + SIDE, y0 + 44, x0 + SIDE + 1, y0 + ph - 10, 0xFF252F45);                  // đường kẻ dọc
 
-            g.drawString(this.font, "AutoSand", x0 + 10, y0 + 9, 0xFFFFFFFF, true);
+            // ----- tiêu đề chữ chuyển màu -----
+            String title = "AutoSand";
+            int tx = x0 + 14;
+            for (int i = 0; i < title.length(); i++) {
+                String ch = title.substring(i, i + 1);
+                g.drawString(this.font, ch, tx, y0 + 13, lerpC(0xFF60A5FA, 0xFFC084FC, i / (float) (title.length() - 1)), true);
+                tx += this.font.width(ch);
+            }
+            g.drawString(this.font, mode.label, tx + 8, y0 + 13, MUTED, false);
+
             String run = enabled ? "ĐANG CHẠY" : "ĐANG TẮT";
-            int runW = this.font.width(run);
-            int runX = x0 + PW - 10 - runW;
-            g.fill(runX - 12, y0 + 10, runX - 6, y0 + 16, enabled ? 0xFF3DDC84 : 0xFFE5484D);
-            g.drawString(this.font, run, runX, y0 + 9, enabled ? 0xFF3DDC84 : 0xFFE5484D, true);
+            int chipW = this.font.width(run) + 24, chipX = x0 + PW - 34 - chipW, chipY = y0 + 9;
+            int chipCol = enabled ? 0xFF22C55E : 0xFFEF4444;
+            rrect(g, chipX, chipY, chipW, 16, 8, chipCol);
+            rrect(g, chipX + 1, chipY + 1, chipW - 2, 14, 7, enabled ? 0xFF10301F : 0xFF35151A);
+            rrect(g, chipX + 7, chipY + 5, 6, 6, 3, chipCol);
+            g.drawString(this.font, run, chipX + 17, chipY + 4, chipCol, false);
 
-            // gạch chân tab đang chọn
-            int tw = (PW - 12 - 4 * 3) / 5;
-            g.fill(x0 + 6 + tab * (tw + 3), y0 + 49, x0 + 6 + tab * (tw + 3) + tw, y0 + 51, 0xFFFFC107);
-
-            int gray = 0xFF9AA4B2, white = 0xFFFFFFFF;
+            // ----- nội dung riêng từng tab -----
             LocalPlayer p = Minecraft.getInstance().player;
-            int ty = cy;
-
             if (tab == 0) {
-                int top = cy + 32;
-                g.fill(cx, top, cx + PW - 20, top + 86, 0xFF18202D);
-                int ly = top + 8, lx = cx + 8;
-                g.drawString(this.font, "Trạng thái:  " + stateText(), lx, ly, white, false);
-                g.drawString(this.font, "Key:  " + License.status(), lx, ly + 14, License.valid() ? 0xFF3DDC84 : 0xFFE5484D, false);
+                rrect(g, cx, cy + 42, cw, 24, 4, 0xFF252F45);
+                rrect(g, cx + 1, cy + 43, cw - 2, 22, 3, 0xFF182032);
+                rrect(g, cx + 9, cy + 51, 6, 6, 3, enabled ? 0xFF22C55E : 0xFF6B7686);
+                g.drawString(this.font, stateText(), cx + 22, cy + 50, TXT, false);
+
+                int sw = (cw - 8) / 3;
                 if (p != null) {
-                    int sp = shovelPct(p);
-                    g.drawString(this.font, "Cát: " + countItem(p, Items.SAND) + "     Xẻng: " + (sp < 0 ? "không có" : sp + "%"), lx, ly + 28, white, false);
-                    g.drawString(this.font, "Bình XP: " + countItem(p, Items.EXPERIENCE_BOTTLE) + "     Đồ ăn: " + countFood(p)
-                        + "     Đói: " + p.getFoodData().getFoodLevel() + "/20", lx, ly + 42, white, false);
+                    int sp = shovelPct(p), food = p.getFoodData().getFoodLevel();
+                    int spCol = sp > 50 ? 0xFF22C55E : sp > 20 ? 0xFFF59E0B : 0xFFEF4444;
+                    stat(g, cx, cy + 72, sw, 36, "Cát", String.valueOf(countItem(p, Items.SAND)), TXT, -1f, 0);
+                    stat(g, cx + sw + 4, cy + 72, sw, 36, "Bình XP", String.valueOf(countItem(p, Items.EXPERIENCE_BOTTLE)), TXT, -1f, 0);
+                    stat(g, cx + 2 * (sw + 4), cy + 72, sw, 36, "Đồ ăn", String.valueOf(countFood(p)), TXT, -1f, 0);
+                    stat(g, cx, cy + 112, sw, 36, "Xẻng", sp < 0 ? "không có" : sp + "%", TXT, sp < 0 ? -1f : sp / 100f, spCol);
+                    stat(g, cx + sw + 4, cy + 112, sw, 36, "Đói", food + "/20", TXT, food / 20f, food <= eatBelow ? 0xFFEF4444 : 0xFFF59E0B);
+                    stat(g, cx + 2 * (sw + 4), cy + 112, sw, 36, "Nhặt cát", pickupLabel(), TXT, -1f, 0);
                 } else {
-                    g.drawString(this.font, "Chưa vào thế giới.", lx, ly + 28, gray, false);
+                    g.drawString(this.font, "Chưa vào thế giới.", cx + 4, cy + 80, MUTED, false);
                 }
-                g.drawString(this.font, "Lệnh: /autosand  |  /autosand toggle", lx, ly + 60, gray, false);
+                rrect(g, cx, cy + 152, cw, 24, 4, 0xFF252F45);
+                rrect(g, cx + 1, cy + 153, cw - 2, 22, 3, 0xFF182032);
+                g.drawString(this.font, "Key: " + License.status(), cx + 9, cy + 160, License.valid() ? 0xFF22C55E : 0xFFEF4444, false);
             } else if (tab == 3) {
-                int ly = cy + 62;
-                g.drawString(this.font, "• Rơi xuống nước / lava: tự bơi lên bờ.", cx, ly, gray, false);
-                g.drawString(this.font, "• Nước / lava / hố phía trước: tự rẽ sang bên.", cx, ly + 13, gray, false);
-                g.drawString(this.font, "• Kẹt dưới hố: nhảy + đặt cát để leo lên.", cx, ly + 26, gray, false);
-                g.drawString(this.font, "• Né quá nhiều lần: tạm nghỉ 30 giây.", cx, ly + 39, gray, false);
+                int iy = cardY(3) + 6;
+                rrect(g, cx, iy, cw, 66, 4, 0xFF252F45);
+                rrect(g, cx + 1, iy + 1, cw - 2, 64, 3, 0xFF182032);
+                bullet(g, "Kẹt nước sâu / lava: tự bơi lên bờ.", cx + 10, iy + 8);
+                bullet(g, "Bị nước bao quanh: đặt cát bắc cầu vào bờ.", cx + 10, iy + 22);
+                bullet(g, "Rơi xuống hố: nhảy + đặt cát để leo, không đào lên.", cx + 10, iy + 36);
+                bullet(g, "Né nước/hố phía trước: chỉ ở chế độ ngoài Baritone.", cx + 10, iy + 50);
             } else if (tab == 4) {
-                g.drawString(this.font, "Trạng thái key:  " + License.status(), cx, ty + 4, License.valid() ? 0xFF3DDC84 : 0xFFE5484D, false);
-                g.drawString(this.font, "Copy key rồi bấm nút dưới, hoặc /autosand key <key>", cx, ty + 20, gray, false);
-                g.drawString(this.font, "Mua key: Zalo " + License.ZALO, cx, ty + 74, white, false);
+                rrect(g, cx, cy, cw, 32, 4, 0xFF252F45);
+                rrect(g, cx + 1, cy + 1, cw - 2, 30, 3, 0xFF182032);
+                g.drawString(this.font, "Trạng thái key", cx + 9, cy + 5, MUTED, false);
+                g.drawString(this.font, License.status(), cx + 9, cy + 18, License.valid() ? 0xFF22C55E : 0xFFEF4444, false);
+                int iy = cy + 76;
+                rrect(g, cx, iy, cw, 60, 4, 0xFF252F45);
+                rrect(g, cx + 1, iy + 1, cw - 2, 58, 3, 0xFF182032);
+                bullet(g, "Copy key rồi bấm nút phía trên.", cx + 10, iy + 8);
+                bullet(g, "Hoặc gõ lệnh: /autosand key <key>", cx + 10, iy + 22);
+                bullet(g, "Mua key: Zalo " + License.ZALO, cx + 10, iy + 36);
             }
 
-            if (tab == 1 || tab == 2 || tab == 3) {
-                g.drawString(this.font, "Rê chuột vào nút để xem giải thích.", x0 + 10, y0 + ph - 40, 0xFF6B7686, false);
+            // ----- vẽ các điều khiển -----
+            for (Ctl c : ctls) drawCtl(g, c, mx, my);
+
+            g.drawString(this.font, "ESC để đóng", x0 + 10, y0 + ph - 18, 0xFF5B6678, false);
+        }
+
+        void drawCtl(GuiGraphics g, Ctl c, int mx, int my) {
+            boolean hov = mx >= c.x && mx < c.x + c.w && my >= c.y && my < c.y + c.h;
+            switch (c.kind) {
+                case 0, 1 -> {
+                    rrect(g, c.x, c.y, c.w, c.h, 4, hov ? 0xFF3B5BDB : 0xFF252F45);
+                    rrect(g, c.x + 1, c.y + 1, c.w - 2, c.h - 2, 3, hov ? 0xFF222C42 : 0xFF182032);
+                    g.fillGradient(c.x + 3, c.y + 1, c.x + c.w - 3, c.y + 1 + c.h / 2, 0x10FFFFFF, 0x00FFFFFF);
+                    boolean showDesc = c.desc != null && c.h >= 26;
+                    int ty = showDesc ? c.y + 4 : c.y + (c.h - 8) / 2;
+                    if (c.kind == 0) {
+                        boolean on = c.on != null && c.on.getAsBoolean();
+                        float target = on ? 1f : 0f;
+                        if (c.t < 0f) c.t = target;
+                        c.t += Math.max(-0.2f, Math.min(0.2f, target - c.t));
+                        rrect(g, c.x + 1, c.y + 4, 3, c.h - 8, 1, on ? 0xFF22C55E : 0xFF3A4254);
+                        int sx = c.x + c.w - 38, sy = c.y + (c.h - 14) / 2;
+                        rrect(g, sx, sy, 28, 14, 7, lerpC(0xFF3A4254, 0xFF22C55E, c.t));
+                        rrect(g, sx + 2 + (int) (c.t * 14), sy + 2, 10, 10, 5, 0xFFFFFFFF);
+                    } else {
+                        rrect(g, c.x + 1, c.y + 4, 3, c.h - 8, 1, 0xFF3B82F6);
+                        String v = c.value == null ? "" : c.value.get();
+                        int chipW = this.font.width(v) + 16, chipX = c.x + c.w - chipW - 8, chipY = c.y + (c.h - 16) / 2;
+                        rrect(g, chipX, chipY, chipW, 16, 5, hov ? 0xFF3B82F6 : 0xFF2B4A9A);
+                        g.drawString(this.font, v, chipX + 8, chipY + 4, TXT, false);
+                    }
+                    g.drawString(this.font, c.title, c.x + 11, ty, TXT, false);
+                    if (showDesc) g.drawString(this.font, c.desc, c.x + 11, c.y + 15, MUTED, false);
+                }
+                case 2 -> {
+                    rrect(g, c.x, c.y, c.w, c.h, 5, hov ? 0xFF7C9CFF : 0xFF3B5BDB);
+                    rrect(g, c.x + 1, c.y + 1, c.w - 2, c.h - 2, 4, hov ? 0xFF3B5BDB : 0xFF2A43A8);
+                    g.fillGradient(c.x + 3, c.y + 1, c.x + c.w - 3, c.y + 1 + c.h / 2, 0x28FFFFFF, 0x00FFFFFF);
+                    g.drawString(this.font, c.title, c.x + (c.w - this.font.width(c.title)) / 2, c.y + (c.h - 8) / 2, TXT, true);
+                }
+                case 3 -> {
+                    float target = enabled ? 1f : 0f;
+                    if (c.t < 0f) c.t = target;
+                    c.t += Math.max(-0.12f, Math.min(0.12f, target - c.t));
+                    int edge = lerpC(0xFFEF4444, 0xFF22C55E, c.t);
+                    int fill = lerpC(hov ? 0xFF4A1C26 : 0xFF35151A, hov ? 0xFF14452D : 0xFF10301F, c.t);
+                    for (int i = 4; i >= 1; i--) rrect(g, c.x - i, c.y - i, c.w + 2 * i, c.h + 2 * i, 6 + i, ((0x20 - i * 5) << 24) | (edge & 0xFFFFFF));
+                    rrect(g, c.x, c.y, c.w, c.h, 6, edge);
+                    rrect(g, c.x + 1, c.y + 1, c.w - 2, c.h - 2, 5, fill);
+                    g.fillGradient(c.x + 4, c.y + 1, c.x + c.w - 4, c.y + 1 + c.h / 2, 0x26FFFFFF, 0x00FFFFFF);
+                    Component label = Component.literal(enabled ? "ĐANG CHẠY  -  bấm để TẮT" : "ĐANG TẮT  -  bấm để BẬT").withStyle(ChatFormatting.BOLD);
+                    g.drawString(this.font, label, c.x + (c.w - this.font.width(label)) / 2, c.y + (c.h - 8) / 2, edge, true);
+                }
+                case 4 -> {
+                    if (c.selected) {
+                        rrect(g, c.x, c.y, c.w, c.h, 5, c.color);
+                        rrect(g, c.x + 1, c.y + 1, c.w - 2, c.h - 2, 4, lerpC(0xFF0F1420, c.color, 0.28f));
+                        rrect(g, c.x + 1, c.y + 5, 3, c.h - 10, 1, c.color);
+                    } else if (hov) {
+                        rrect(g, c.x, c.y, c.w, c.h, 5, 0xFF1B2437);
+                    }
+                    rrect(g, c.x + 10, c.y + (c.h - 6) / 2, 6, 6, 3, c.color);
+                    g.drawString(this.font, c.title, c.x + 22, c.y + (c.h - 8) / 2, c.selected ? TXT : (hov ? 0xFFD5DCE8 : MUTED), false);
+                }
+                default -> {
+                    rrect(g, c.x, c.y, c.w, c.h, 8, hov ? 0xFFEF4444 : 0xFF2A3347);
+                    g.drawString(this.font, c.title, c.x + (c.w - this.font.width(c.title)) / 2, c.y + (c.h - 8) / 2, TXT, false);
+                }
             }
         }
 
