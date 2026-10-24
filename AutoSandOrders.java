@@ -1202,7 +1202,7 @@ public class AutoSandOrders implements ClientModInitializer {
         public static final String ZALO = deobf(ZALO_ENC);
 
         /** Dán public key (do `java KeyGen.java genpair` in ra) vào đây. */
-        private static final String PUBLIC_KEY_B64 = "MCowBQYDK2VwAyEAtxxbnLFOwiBxighydzyT7BJukyEvV2Z4HE4BwgxMsr0=";
+        private static final String PUBLIC_KEY_B64 = "MCowBQYDK2VwAyEApzgJ1pBXAaWCis600YXOZdixCnUSeUK8sokGlHAjF24=";
 
         private static final byte[] DOMAIN_ENC = {36, 16, 17, 10, 54, 4, 11, 1, 74, 14, 0, 28, 74, 19, 84}; // XOR("AutoSand/key/v1", 0x65)
         private static final byte[] DOMAIN = deobf(DOMAIN_ENC).getBytes(StandardCharsets.UTF_8);
