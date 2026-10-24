@@ -69,6 +69,10 @@ import java.util.function.Predicate;
  * 8) Ưu tiên nhặt cát: thấy cát rơi trong bán kính chỉnh được -> đi tới nhặt rồi đào tiếp.
  * 9) Tự bật lại: Baritone / Nuker tự dừng, lỗi, hoặc chết rồi hồi sinh -> tự gửi lại lệnh đào.
  *
+ * 10) Chế độ "Tự đào" (mặc định, KHÔNG cần Baritone): xem AutoMiner.java. Tự tìm cát, tìm đường A*, đào xuyên
+ *     cát / đất chắn đường, nhặt cát rơi, thăm dò khi hết cát. Chết -> ghi nhớ toạ độ -> tự hồi sinh -> /home cat
+ *     -> đi về chỗ chết nhặt đồ -> xẻng về thanh công cụ, cát về túi -> đào tiếp. Đổi lệnh: /autosand home <lệnh>
+ *
  * Key:    50 key ngắn (8 ký tự) vĩnh viễn có sẵn trong mod (xem class License). /autosand key <key> | status
  *
  * Lệnh:  /autosand            mở bảng GUI tuỳ chỉnh
@@ -113,13 +117,18 @@ public class AutoSandOrders implements ClientModInitializer {
 
     // ===================== CẤU HÌNH (đổi bằng GUI, tự lưu) =====================
     enum Mode {
-        BARITONE("Baritone"), KEYS("Giữ phím"), NUKER("Chỉ Nuker");
+        BUILTIN("Tự đào"), BARITONE("Baritone"), KEYS("Giữ phím"), NUKER("Chỉ Nuker");
         final String label;
         Mode(String l) { label = l; }
-        Mode next() { return values()[(ordinal() + 1) % values().length]; }
+        /** Bỏ qua BARITONE: mod không dùng Baritone nữa (giữ enum để file cấu hình cũ không lỗi). */
+        Mode next() {
+            Mode m = this;
+            do { m = values()[(m.ordinal() + 1) % values().length]; } while (m == BARITONE);
+            return m;
+        }
     }
 
-    static Mode mode = Mode.BARITONE;
+    static Mode mode = Mode.BUILTIN;
     static boolean useNuker = true;
     static boolean keysForward = true;
     static boolean autoDeliver = true;
@@ -213,6 +222,16 @@ public class AutoSandOrders implements ClientModInitializer {
                             save();
                             ctx.getSource().sendFeedback(Component.literal("[AutoSand] Lệnh shop: /" + SHOP_COMMAND));
                             return 1;
+                        })))
+                .then(ClientCommandManager.literal("home")
+                    .then(ClientCommandManager.argument("text", StringArgumentType.greedyString())
+                        .executes(ctx -> {
+                            String t = StringArgumentType.getString(ctx, "text").trim();
+                            if (t.startsWith("/")) t = t.substring(1);
+                            AutoMiner.homeCmd = t;
+                            save();
+                            ctx.getSource().sendFeedback(Component.literal("[AutoSand] Lệnh về home sau khi chết: /" + AutoMiner.homeCmd));
+                            return 1;
                         })))));
     }
 
@@ -227,7 +246,8 @@ public class AutoSandOrders implements ClientModInitializer {
             if (!Files.exists(f)) return;
             Properties pr = new Properties();
             try (var in = Files.newInputStream(f)) { pr.load(in); }
-            try { mode = Mode.valueOf(pr.getProperty("mode", "BARITONE")); } catch (Exception e) { mode = Mode.BARITONE; }
+            try { mode = Mode.valueOf(pr.getProperty("mode", "BUILTIN")); } catch (Exception e) { mode = Mode.BUILTIN; }
+            if (mode == Mode.BARITONE) mode = Mode.BUILTIN;      // cấu hình cũ dùng Baritone -> chuyển sang tự đào
             useNuker = Boolean.parseBoolean(pr.getProperty("nuker", "true"));
             keysForward = Boolean.parseBoolean(pr.getProperty("keysForward", "true"));
             autoDeliver = Boolean.parseBoolean(pr.getProperty("deliver", "true"));
@@ -245,6 +265,11 @@ public class AutoSandOrders implements ClientModInitializer {
             bridgeWater = Boolean.parseBoolean(pr.getProperty("bridge", "true"));
             ORDER_COMMAND = pr.getProperty("orderCmd", ORDER_COMMAND);
             SHOP_COMMAND = pr.getProperty("shopCmd", SHOP_COMMAND);
+            AutoMiner.homeCmd = pr.getProperty("homeCmd", AutoMiner.homeCmd);
+            AutoMiner.deathRecover = Boolean.parseBoolean(pr.getProperty("deathRecover", "true"));
+            AutoMiner.autoRespawn = Boolean.parseBoolean(pr.getProperty("autoRespawn", "true"));
+            AutoMiner.digThrough = Boolean.parseBoolean(pr.getProperty("digThrough", "true"));
+            AutoMiner.scanRadius = Integer.parseInt(pr.getProperty("scanRadius", "16"));
         } catch (Exception ignored) { }
     }
 
@@ -269,6 +294,11 @@ public class AutoSandOrders implements ClientModInitializer {
             pr.setProperty("bridge", String.valueOf(bridgeWater));
             pr.setProperty("orderCmd", ORDER_COMMAND);
             pr.setProperty("shopCmd", SHOP_COMMAND);
+            pr.setProperty("homeCmd", AutoMiner.homeCmd);
+            pr.setProperty("deathRecover", String.valueOf(AutoMiner.deathRecover));
+            pr.setProperty("autoRespawn", String.valueOf(AutoMiner.autoRespawn));
+            pr.setProperty("digThrough", String.valueOf(AutoMiner.digThrough));
+            pr.setProperty("scanRadius", String.valueOf(AutoMiner.scanRadius));
             try (var out = Files.newOutputStream(cfgFile())) { pr.store(out, "AutoSand"); }
         } catch (Exception ignored) { }
     }
@@ -286,6 +316,7 @@ public class AutoSandOrders implements ClientModInitializer {
         cooldown = 0;
         wait = 0;
         guardReset(mc, p);
+        AutoMiner.reset(mc);
         if (p != null) {
             if (on) {
                 applyBaritoneSettings(p);
@@ -305,6 +336,7 @@ public class AutoSandOrders implements ClientModInitializer {
     // ----------------------------- ĐIỀU KHIỂN ĐÀO -----------------------------
     static void startMining(LocalPlayer p) {
         if (!License.valid()) return;
+        if (mode == Mode.BUILTIN) { AutoMiner.start(p); return; }      // tự đào: không cần Baritone / Nuker
         if (useNuker) send(p, NUKER_ON);
         if (mode == Mode.BARITONE) send(p, BARITONE_MINE);
     }
@@ -318,6 +350,7 @@ public class AutoSandOrders implements ClientModInitializer {
     }
 
     static void stopMining(Minecraft mc, LocalPlayer p) {
+        if (mode == Mode.BUILTIN) { AutoMiner.stop(mc); return; }
         if (mode == Mode.BARITONE) send(p, BARITONE_STOP);
         if (useNuker) send(p, NUKER_OFF);
         releaseKeys(mc);
@@ -354,9 +387,13 @@ public class AutoSandOrders implements ClientModInitializer {
                 cooldown = 40;
                 reviveIn = 60;
                 wdX = Double.NaN;
+                if (mode == Mode.BUILTIN) AutoMiner.onRespawn(mc, p);   // chết -> /home -> về chỗ chết nhặt đồ
             }
         }
-        if (p.isDeadOrDying()) return;
+        if (p.isDeadOrDying()) {
+            if (mode == Mode.BUILTIN) AutoMiner.onDead(mc, p);          // ghi nhớ toạ độ chết + tự hồi sinh
+            return;
+        }
         if (reviveIn > 0 && --reviveIn == 0) { applyBaritoneSettings(p); startMining(p); }
 
         if (++licTick >= 20) {                           // mỗi ~1 giây kiểm tra lại key
@@ -378,6 +415,10 @@ public class AutoSandOrders implements ClientModInitializer {
             if (mode == Mode.KEYS) {
                 mc.options.keyAttack.setDown(true);
                 mc.options.keyUp.setDown(keysForward);
+            }
+            if (mode == Mode.BUILTIN) {
+                AutoMiner.tick(mc, p);                                  // tự đào / tự nhặt / nhặt đồ sau khi chết
+                if (AutoMiner.recovering()) return;                     // đang nhặt đồ: không dọn rác, ăn, giao cát
             }
             if (junkCool > 0) junkCool--;
             if (wait > 0) { wait--; return; }
@@ -1606,7 +1647,7 @@ public class AutoSandOrders implements ClientModInitializer {
         }
 
         // 3) nước / lava / hố ngay phía trước -> né sang bên
-        if (mode != Mode.BARITONE && (avoidLiquid || avoidHole) && guardCool <= 0 && sideLock <= 0 && p.onGround()) {
+        if (mode != Mode.BARITONE && mode != Mode.BUILTIN && (avoidLiquid || avoidHole) && guardCool <= 0 && sideLock <= 0 && p.onGround()) {
             var v = p.getDeltaMovement();
             double h = Math.hypot(v.x, v.z);
             if (h > 0.08 && hazardDir(lv, p.getX(), p.getY(), p.getZ(), v.x / h, v.z / h)) {
@@ -1616,14 +1657,14 @@ public class AutoSandOrders implements ClientModInitializer {
         }
 
         // 4) ưu tiên nhặt cát đang rơi gần đó
-        if (mode != Mode.BARITONE && pickupRadius > 0 && pickCool <= 0 && guardCool <= 0 && p.onGround() && !isFull(p)) {
+        if (mode != Mode.BARITONE && mode != Mode.BUILTIN && pickupRadius > 0 && pickCool <= 0 && guardCool <= 0 && p.onGround() && !isFull(p)) {
             ItemEntity it = nearestSand(lv, p);
             if (it != null) { startPickup(mc, p, it); return true; }
         }
 
         // 5) watchdog: Baritone / Nuker tự dừng, báo lỗi, hết đường... -> tự bật lại.
         //    "Đang làm việc" = có di chuyển, đang phá khối, hoặc số cát trong túi vừa thay đổi.
-        if (autoRevive && (mode == Mode.BARITONE || useNuker) && ++wdTick >= WD_STEP) {
+        if (autoRevive && mode != Mode.BUILTIN && (mode == Mode.BARITONE || useNuker) && ++wdTick >= WD_STEP) {
             wdTick = 0;
             double moved = Double.isNaN(wdX) ? 99 : Math.hypot(p.getX() - wdX, p.getZ() - wdZ);
             wdX = p.getX();
@@ -2013,6 +2054,7 @@ public class AutoSandOrders implements ClientModInitializer {
     /** Trạng thái hiện tại bằng chữ dễ hiểu (hiện ở tab Chính). */
     static String stateText() {
         if (!enabled) return "Đang tắt";
+        if (mode == Mode.BUILTIN && AutoMiner.recovering()) return AutoMiner.recoverText();
         if (state == S.MINING && guard != G.NONE) {
             return switch (guard) {
                 case LIQUID -> "Đang thoát khỏi nước / lava";
@@ -2071,8 +2113,8 @@ public class AutoSandOrders implements ClientModInitializer {
 
     static class AutoSandScreen extends Screen {
         static final int PW = 392, SIDE = 94;
-        static final String[] TABS = {"Chính", "Đào cát", "Sinh tồn", "An toàn", "Key"};
-        static final int[] TAB_COL = {0xFF3B82F6, 0xFFF59E0B, 0xFF22C55E, 0xFFEF4444, 0xFFA855F7};
+        static final String[] TABS = {"Chính", "Đào cát", "Sinh tồn", "An toàn", "Key", "Tự đào"};
+        static final int[] TAB_COL = {0xFF3B82F6, 0xFFF59E0B, 0xFF22C55E, 0xFFEF4444, 0xFFA855F7, 0xFF14B8A6};
         static final int TXT = 0xFFFFFFFF, MUTED = 0xFF8A94A6;
 
         /** Một điều khiển tự vẽ (nút thật của game nằm bên dưới, trong suốt, chỉ để nhận chuột). */
@@ -2141,7 +2183,7 @@ public class AutoSandOrders implements ClientModInitializer {
                 case 0 -> add(3, cx, cy, cw, 36, "", null, () -> setEnabled(Minecraft.getInstance(), !enabled));
                 case 1 -> {
                     begin(6);
-                    cycle(0, "Chế độ đào", "Baritone, giữ phím hoặc chỉ Nuker", () -> mode.label, () -> {
+                    cycle(0, "Chế độ đào", "Tự đào (có sẵn), giữ phím hoặc chỉ Nuker", () -> mode.label, () -> {
                         Minecraft mc = Minecraft.getInstance();
                         boolean running = enabled && state == S.MINING && mc.player != null;
                         if (running) stopMining(mc, mc.player);
@@ -2193,6 +2235,19 @@ public class AutoSandOrders implements ClientModInitializer {
                     toggle(0, "Thoát nước sâu / lava", "Kẹt nước sâu hoặc lava -> tự bơi lên bờ", () -> avoidLiquid, v -> avoidLiquid = v);
                     toggle(1, "Bắc cầu qua nước", "Bị nước bao quanh -> đặt block đi vào bờ", () -> bridgeWater, v -> bridgeWater = v);
                     toggle(2, "Né hố & tự leo", "Rơi xuống hố -> tự đặt block leo lên", () -> avoidHole, v -> avoidHole = v);
+                }
+                case 5 -> {
+                    begin(4);
+                    toggle(0, "Chết -> về nhặt đồ", "Hồi sinh -> /home -> về chỗ chết nhặt lại đồ", () -> AutoMiner.deathRecover, v -> AutoMiner.deathRecover = v);
+                    toggle(1, "Tự hồi sinh", "Chết thì tự bấm nút Hồi sinh", () -> AutoMiner.autoRespawn, v -> AutoMiner.autoRespawn = v);
+                    toggle(2, "Đào xuyên khi đi", "Cát / đất chắn đường thì đào qua", () -> AutoMiner.digThrough, v -> AutoMiner.digThrough = v);
+                    cycle(3, "Phạm vi tìm cát", "Tìm cát trong bán kính này", () -> AutoMiner.scanRadius + " ô", () -> {
+                        int next = AutoMiner.SCAN_LEVELS[0];
+                        for (int v : AutoMiner.SCAN_LEVELS) {
+                            if (v > AutoMiner.scanRadius) { next = v; break; }
+                        }
+                        AutoMiner.scanRadius = next;
+                    });
                 }
                 default -> add(2, cx, cy + 40, cw, 28, "Dán key từ clipboard", null, () -> {
                     Minecraft mc = Minecraft.getInstance();
@@ -2286,6 +2341,13 @@ public class AutoSandOrders implements ClientModInitializer {
                 bullet(g, "Bị nước bao quanh: đặt cát bắc cầu vào bờ.", cx + 10, iy + 22);
                 bullet(g, "Rơi xuống hố: nhảy + đặt cát để leo, không đào lên.", cx + 10, iy + 36);
                 bullet(g, "Né nước/hố phía trước: chỉ ở chế độ ngoài Baritone.", cx + 10, iy + 50);
+            } else if (tab == 5) {
+                int iy = cardY(4) + 6;
+                rrect(g, cx, iy, cw, 50, 4, 0xFF252F45);
+                rrect(g, cx + 1, iy + 1, cw - 2, 48, 3, 0xFF182032);
+                bullet(g, "Sau khi chết: /" + AutoMiner.homeCmd, cx + 10, iy + 8);
+                bullet(g, AutoMiner.deathText(), cx + 10, iy + 22);
+                bullet(g, "Xong: xẻng về thanh công cụ.", cx + 10, iy + 36);
             } else if (tab == 4) {
                 rrect(g, cx, cy, cw, 32, 4, 0xFF252F45);
                 rrect(g, cx + 1, cy + 1, cw - 2, 30, 3, 0xFF182032);
