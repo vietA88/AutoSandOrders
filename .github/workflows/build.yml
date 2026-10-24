@@ -32,6 +32,8 @@ jobs:
           mkdir -p src/main/java/autosand src/main/resources
           cp AutoSandOrders.java src/main/java/autosand/AutoSandOrders.java
 
+          sed -i 's/License\.quickCheck()/License.valid()/g' src/main/java/autosand/AutoSandOrders.java
+
           cat > settings.gradle <<'EOF'
           pluginManagement {
               repositories {
