@@ -1,5 +1,6 @@
 package autosand;
 
+import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
@@ -30,7 +31,13 @@ import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
 import java.nio.charset.StandardCharsets;
@@ -39,10 +46,15 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.text.Normalizer;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Properties;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
@@ -72,6 +84,10 @@ import java.util.function.Predicate;
  * 10) Chế độ "Tự đào" (mặc định, KHÔNG cần Baritone): xem AutoMiner.java. Tự tìm cát, tìm đường A*, đào xuyên
  *     cát / đất chắn đường, nhặt cát rơi, thăm dò khi hết cát. Chết -> ghi nhớ toạ độ -> tự hồi sinh -> /home cat
  *     -> đi về chỗ chết nhặt đồ -> xẻng về thanh công cụ, cát về túi -> đào tiếp. Đổi lệnh: /autosand home <lệnh>
+ *
+ * 11) Về sảnh (bị kick): bấm la bàn -> chọn KingSMP -> quay lại đào (xem class Lobby).
+ * 12) Chết: đứng yên 10 giây sau /home, mũi tên chỉ đường tới chỗ chết, có thể ném ngọc Ender tới chỗ chết (xem AutoMiner).
+ * 13) Thanh công cụ cố định: ô1 xẻng, ô2 cà rốt vàng, ô3 cát, ô4-9 bình XP; đồ khác tự vứt. Tab "Thống kê" trong GUI.
  *
  * Key:    50 key ngắn (8 ký tự) vĩnh viễn có sẵn trong mod (xem class License). /autosand key <key> | status
  *
@@ -103,6 +119,8 @@ public class AutoSandOrders implements ClientModInitializer {
     static final int BOTTLE_SLOT = 1;       // ô số 2 trên thanh công cụ (đếm từ 0)
     static final int MEND_TARGET_PCT = 100; // sửa xẻng tới bao nhiêu % (100 = đầy). Hạ xuống để tiết kiệm bình
 
+    static final int SHOP_PEARL_SLOT = 14;  // SHOP -> GEAR: ô Ngọc Ender (dự phòng)
+    static final int KING_SLOT = 24;        // menu sảnh: ô KingSMP (dự phòng nếu không tìm thấy theo tên)
     static final int SHOP_TOTEM_SLOT = 13;  // /shop: ô totem
     static final int SHOP_BOTTLE_SLOT = 16; // SHOP -> GEAR: ô bình XP
     static final int BUY_SET64_SLOT = 17;   // "đặt thành 64"
@@ -141,6 +159,12 @@ public class AutoSandOrders implements ClientModInitializer {
     static int eatBelow = 14;               // thanh đói (0-20) <= mức này thì ăn
     static int pickupRadius = 8;            // bán kính ưu tiên nhặt cát (0 = tắt)
     static boolean autoRevive = true;       // Baritone / Nuker tự dừng -> tự bật lại
+    static boolean autoRejoin = true;       // bị kick ra sảnh -> la bàn -> KingSMP
+    static boolean usePearl = true;         // chết xa -> mua ngọc Ender ném tới chỗ chết
+    static double pricePerSand = 5.0;       // ước tính tiền / 1 cát giao đơn (chỉnh bằng /autosand price <số>)
+    static long statSand = 0, statTicks = 0;
+    static int statDeaths = 0;
+    static final double[] PRICE_LEVELS = {1, 2, 5, 10, 20, 50};
     static final int[] PICKUP_LEVELS = {0, 4, 8, 12};
     static final int[] EAT_LEVELS = {8, 12, 14, 16};
     static String ORDER_COMMAND = "orders sand";
@@ -172,6 +196,8 @@ public class AutoSandOrders implements ClientModInitializer {
     static int foodBuyFails = 0, junkCool = 0, junkStep = 0, junkDropped = 0, eatPrevSlot = -1;
     static float eatXRot = Float.NaN, junkXRot = Float.NaN;
     static boolean shovelSwapped = false, needBuy = false;
+    static boolean buyPearl = false;
+    static int pearlNeed = 1, junkMoves = 0, lastDelivered = 0;
     static float oldXRot = Float.NaN, dropXRot = Float.NaN;
 
     // ----------------------------- KHỞI TẠO -----------------------------
@@ -223,6 +249,14 @@ public class AutoSandOrders implements ClientModInitializer {
                             ctx.getSource().sendFeedback(Component.literal("[AutoSand] Lệnh shop: /" + SHOP_COMMAND));
                             return 1;
                         })))
+                .then(ClientCommandManager.literal("price")
+                    .then(ClientCommandManager.argument("value", DoubleArgumentType.doubleArg(0))
+                        .executes(ctx -> {
+                            pricePerSand = DoubleArgumentType.getDouble(ctx, "value");
+                            save();
+                            ctx.getSource().sendFeedback(Component.literal("[AutoSand] Giá ước tính mỗi cát: " + pricePerSand + " $"));
+                            return 1;
+                        })))
                 .then(ClientCommandManager.literal("home")
                     .then(ClientCommandManager.argument("text", StringArgumentType.greedyString())
                         .executes(ctx -> {
@@ -270,6 +304,12 @@ public class AutoSandOrders implements ClientModInitializer {
             AutoMiner.autoRespawn = Boolean.parseBoolean(pr.getProperty("autoRespawn", "true"));
             AutoMiner.digThrough = Boolean.parseBoolean(pr.getProperty("digThrough", "true"));
             AutoMiner.scanRadius = Integer.parseInt(pr.getProperty("scanRadius", "16"));
+            autoRejoin = Boolean.parseBoolean(pr.getProperty("autoRejoin", "true"));
+            usePearl = Boolean.parseBoolean(pr.getProperty("usePearl", "true"));
+            pricePerSand = Double.parseDouble(pr.getProperty("pricePerSand", "5"));
+            statSand = Long.parseLong(pr.getProperty("statSand", "0"));
+            statTicks = Long.parseLong(pr.getProperty("statTicks", "0"));
+            statDeaths = Integer.parseInt(pr.getProperty("statDeaths", "0"));
         } catch (Exception ignored) { }
     }
 
@@ -299,6 +339,12 @@ public class AutoSandOrders implements ClientModInitializer {
             pr.setProperty("autoRespawn", String.valueOf(AutoMiner.autoRespawn));
             pr.setProperty("digThrough", String.valueOf(AutoMiner.digThrough));
             pr.setProperty("scanRadius", String.valueOf(AutoMiner.scanRadius));
+            pr.setProperty("autoRejoin", String.valueOf(autoRejoin));
+            pr.setProperty("usePearl", String.valueOf(usePearl));
+            pr.setProperty("pricePerSand", String.valueOf(pricePerSand));
+            pr.setProperty("statSand", String.valueOf(statSand));
+            pr.setProperty("statTicks", String.valueOf(statTicks));
+            pr.setProperty("statDeaths", String.valueOf(statDeaths));
             try (var out = Files.newOutputStream(cfgFile())) { pr.store(out, "AutoSand"); }
         } catch (Exception ignored) { }
     }
@@ -312,6 +358,8 @@ public class AutoSandOrders implements ClientModInitializer {
             return;
         }
         enabled = on;
+        nukerState = null;
+        Lobby.reset();
         state = S.MINING;
         cooldown = 0;
         wait = 0;
@@ -336,8 +384,8 @@ public class AutoSandOrders implements ClientModInitializer {
     // ----------------------------- ĐIỀU KHIỂN ĐÀO -----------------------------
     static void startMining(LocalPlayer p) {
         if (!License.valid()) return;
-        if (mode == Mode.BUILTIN) { AutoMiner.start(p); return; }      // tự đào: không cần Baritone / Nuker
-        if (useNuker) send(p, NUKER_ON);
+        if (useNuker) setNuker(p, true);                                // luôn tự bật Nuker khi bắt đầu đào
+        if (mode == Mode.BUILTIN) { AutoMiner.start(p); return; }      // tự đào: không cần Baritone
         if (mode == Mode.BARITONE) send(p, BARITONE_MINE);
     }
 
@@ -350,9 +398,9 @@ public class AutoSandOrders implements ClientModInitializer {
     }
 
     static void stopMining(Minecraft mc, LocalPlayer p) {
+        if (useNuker) setNuker(p, false);
         if (mode == Mode.BUILTIN) { AutoMiner.stop(mc); return; }
         if (mode == Mode.BARITONE) send(p, BARITONE_STOP);
-        if (useNuker) send(p, NUKER_OFF);
         releaseKeys(mc);
     }
 
@@ -372,6 +420,7 @@ public class AutoSandOrders implements ClientModInitializer {
             mc.setScreen(new AutoSandScreen());
             return;
         }
+        AutoMiner.arrowTick(mc, p);                          // mũi tên chỉ đường tới chỗ chết
         if (!enabled) { lastPlayer = p; return; }
 
         // Chết rồi hồi sinh / vào lại thế giới: LocalPlayer mới -> reset trạng thái và bật lại lệnh đào
@@ -395,6 +444,7 @@ public class AutoSandOrders implements ClientModInitializer {
             return;
         }
         if (reviveIn > 0 && --reviveIn == 0) { applyBaritoneSettings(p); startMining(p); }
+        if (++statTicks % 1200 == 0) save();                 // thời gian treo (tính cả lúc lưu thống kê mỗi phút)
 
         if (++licTick >= 20) {                           // mỗi ~1 giây kiểm tra lại key
             licTick = 0;
@@ -407,6 +457,7 @@ public class AutoSandOrders implements ClientModInitializer {
         }
         // Chốt chặn thứ 2, lệch pha với chốt trên: bypass 1 chỗ vẫn bị chặn ở chỗ còn lại.
         if (!License.quickCheck()) { setEnabled(mc, false); return; }
+        if (Lobby.tick(mc, p)) return;                       // bị kick ra sảnh -> tự quay lại KingSMP
 
         if (state == S.MINING && mc.screen == null && guardTick(mc, p)) return;   // an toàn: nước / lava / hố
 
@@ -425,7 +476,7 @@ public class AutoSandOrders implements ClientModInitializer {
             if (cooldown > 0) { cooldown--; return; }
 
             // 1) vứt đồ rác (không phải cát / bình XP / xẻng / đồ ăn)
-            if (autoDrop && junkCool <= 0 && junkSlot(p) >= 0) {
+            if (autoDrop && junkCool <= 0 && (junkSlot(p) >= 0 || arrangeMove(p) != null)) {
                 startJunk(mc, p);
                 return;
             }
@@ -548,7 +599,10 @@ public class AutoSandOrders implements ClientModInitializer {
                 if (h == null || h.containerId == lastSync || h.getRowCount() != 3) return;
                 int slot = find(h, st -> nameHas(st, "xác nhận", "confirm"), -1);
                 if (slot < 0) slot = CONFIRM_SLOT;
+                lastDelivered = Math.max(0, sandBefore - countItem(p, Items.SAND));
                 click(mc, p, h, slot, ClickType.PICKUP);
+                statSand += lastDelivered;
+                save();
                 state = S.FINISH;
                 closes = 0;
                 finishIdle = 0;
@@ -581,11 +635,12 @@ public class AutoSandOrders implements ClientModInitializer {
             case MEND_PREP -> {
                 if (mc.screen != null) { p.closeContainer(); wait = 2; return; }
                 if (step == 0) {
-                    // bình XP -> ô số 2 thanh công cụ
-                    if (!p.getInventory().getItem(BOTTLE_SLOT).is(Items.EXPERIENCE_BOTTLE)) {
+                    // bình XP -> ô 4-9 thanh công cụ
+                    int bs = bottleSlot(p);
+                    if (!p.getInventory().getItem(bs).is(Items.EXPERIENCE_BOTTLE)) {
                         int idx = findItem(p, Items.EXPERIENCE_BOTTLE);
                         if (idx < 0) { abort(mc, "không có bình XP"); return; }
-                        swapHotbar(mc, p, idx, BOTTLE_SLOT);
+                        swapHotbar(mc, p, idx, bs);
                         wait = ACTION_DELAY;
                     }
                     step = 1;
@@ -603,7 +658,7 @@ public class AutoSandOrders implements ClientModInitializer {
                     return;
                 }
                 // step 2: cầm bình XP bằng tay phải
-                setSelected(p, BOTTLE_SLOT);
+                setSelected(p, bottleSlot(p));
                 oldXRot = p.getXRot();
                 mendThrows = 0;
                 lastCheck = 0;
@@ -619,14 +674,15 @@ public class AutoSandOrders implements ClientModInitializer {
                     state = S.MEND_RESTORE;
                     return;
                 }
-                if (!p.getInventory().getItem(BOTTLE_SLOT).is(Items.EXPERIENCE_BOTTLE)) {
+                int bs = bottleSlot(p);
+                if (!p.getInventory().getItem(bs).is(Items.EXPERIENCE_BOTTLE)) {
                     int idx = findItem(p, Items.EXPERIENCE_BOTTLE);
                     if (idx < 0) { needBuy = true; state = S.MEND_RESTORE; return; }
-                    swapHotbar(mc, p, idx, BOTTLE_SLOT);
+                    swapHotbar(mc, p, idx, bs);
                     wait = ACTION_DELAY;
                     return;
                 }
-                if (getSelected(p) != BOTTLE_SLOT) { setSelected(p, BOTTLE_SLOT); wait = 2; return; }
+                if (getSelected(p) != bs) { setSelected(p, bs); wait = 2; return; }
 
                 if (mendThrows - lastCheck >= 10) {
                     int dmg = off.getDamageValue();
@@ -671,19 +727,20 @@ public class AutoSandOrders implements ClientModInitializer {
             // ================= MUA BÌNH XP (ĐẦY THANH CÔNG CỤ) =================
             case BUY_PREP -> {
                 if (mc.screen != null) { p.closeContainer(); wait = 2; return; }
-                int sand = hotbarSandSlot(p);
+                int d = buyDropSlot(p);                        // ô 4-9 chứa cát / đồ khác (không phải bình XP)
 
                 if (dropStep == 0) {
-                    if (sand < 0) { dropStep = 2; return; }   // thanh công cụ không có cát
+                    if (d < 0) { dropStep = 2; return; }       // ô 4-9 đã sạch
                     dropXRot = p.getXRot();
-                    p.setXRot(0f);                             // nhìn ngang để cát văng xa, không bị nhặt lại
+                    p.setXRot(0f);                             // nhìn ngang để đồ văng xa, không bị nhặt lại
                     dropStep = 1;
                     wait = 3;                                  // chờ server nhận hướng nhìn mới
                     return;
                 }
                 if (dropStep == 1) {
-                    if (sand >= 0) {
-                        dropStack(mc, p, sand);                // vứt cả stack cát ra ngoài
+                    if (d >= 0 && junkDropped < 40) {
+                        dropStack(mc, p, d);                   // vứt cả stack ra ngoài
+                        junkDropped++;
                         wait = 2;
                         return;
                     }
@@ -692,7 +749,7 @@ public class AutoSandOrders implements ClientModInitializer {
                     wait = ACTION_DELAY;
                     return;
                 }
-                // dropStep == 2: thanh công cụ đã sạch cát -> tính số lần mua rồi mở shop
+                // dropStep == 2: ô 4-9 đã trống -> tính số lần mua để đầy thanh công cụ rồi mở shop
                 buyRound = 0;
                 buyTarget = Math.max(1, Math.min(BUY_MAX_ROUNDS, (hotbarMissing(p) + 63) / 64));
                 send(p, "/" + SHOP_COMMAND);
@@ -722,6 +779,9 @@ public class AutoSandOrders implements ClientModInitializer {
                 if (buyFood) {                               // SHOP -> FOOD: Cà Rốt Vàng
                     i = find(h, st -> st.is(Items.GOLDEN_CARROT), -1);
                     if (i < 0) i = SHOP_FOOD_ITEM_SLOT;
+                } else if (buyPearl) {                       // SHOP -> GEAR: Ngọc Ender
+                    i = find(h, st -> st.is(Items.ENDER_PEARL), -1);
+                    if (i < 0) i = SHOP_PEARL_SLOT;
                 } else {
                     i = find(h, st -> st.is(Items.EXPERIENCE_BOTTLE), -1);
                     if (i < 0) i = SHOP_BOTTLE_SLOT;
@@ -734,6 +794,14 @@ public class AutoSandOrders implements ClientModInitializer {
             }
             case BUY_AMOUNT -> {
                 if (h == null || h.containerId == lastSync || h.getRowCount() != 3 || !loaded(h)) return;
+                if (buyPearl) {                              // ngọc Ender: giữ số lượng mặc định, bấm xác nhận luôn
+                    lastSync = h.containerId;
+                    gone = 0;
+                    state = S.BUY_CONFIRM;
+                    timeout = STEP_TIMEOUT;
+                    wait = ACTION_DELAY;
+                    return;
+                }
                 int i = find(h, st -> nameHas(st, "64"), 13);
                 if (i < 0) {
                     i = BUY_SET64_SLOT;
@@ -772,7 +840,7 @@ public class AutoSandOrders implements ClientModInitializer {
                 if (mc.screen != null) { p.closeContainer(); wait = 3; return; }
                 buyRound++;
                 buyRetry = 0;
-                if (buyRound < buyTarget) {
+                if (buyRound < buyTarget && (!buyPearl || countItem(p, Items.ENDER_PEARL) < pearlNeed)) {
                     // thanh công cụ chưa đầy -> mua thêm 1 stack nữa
                     send(p, "/" + SHOP_COMMAND);
                     state = S.BUY_SHOP;
@@ -801,12 +869,20 @@ public class AutoSandOrders implements ClientModInitializer {
                     wait = 2;
                     return;
                 }
+                int[] mv = arrangeMove(p);                   // xếp: ô1 xẻng, ô2 cà rốt vàng, ô3 cát, ô4-9 bình XP
+                if (mv != null && junkMoves < 40) {
+                    swapHotbar(mc, p, mv[0], mv[1]);
+                    junkMoves++;
+                    timeout = STEP_TIMEOUT;
+                    wait = 3;
+                    return;
+                }
                 if (!Float.isNaN(junkXRot)) { p.setXRot(junkXRot); junkXRot = Float.NaN; }
                 state = S.MINING;
                 junkCool = JUNK_INTERVAL;
                 cooldown = 10;
                 startMining(p);
-                msg(p, "Đã vứt " + junkDropped + " stack đồ không cần.");
+                if (junkDropped > 0 || junkMoves > 0) msg(p, "Đã vứt " + junkDropped + " stack, xếp lại " + junkMoves + " ô thanh công cụ.");
             }
 
             // ================= ĂN KHI ĐÓI =================
@@ -887,6 +963,7 @@ public class AutoSandOrders implements ClientModInitializer {
         state = S.JUNK;
         junkStep = 0;
         junkDropped = 0;
+        junkMoves = 0;
         timeout = STEP_TIMEOUT;
         wait = ACTION_DELAY;
     }
@@ -903,6 +980,7 @@ public class AutoSandOrders implements ClientModInitializer {
         stopMining(mc, p);
         msg(p, "Hết đồ ăn, đi mua thêm.");
         buyFood = true;
+        buyPearl = false;
         buyRound = 0;
         buyTarget = 1;
         buyRetry = 0;
@@ -952,6 +1030,8 @@ public class AutoSandOrders implements ClientModInitializer {
     /** Vào quy trình mua: vứt cát trên thanh công cụ -> /shop -> mua tới khi đầy thanh công cụ. */
     static void beginBuy() {
         buyFood = false;
+        buyPearl = false;
+        junkDropped = 0;
         dropStep = 0;
         buyRound = 0;
         buyRetry = 0;
@@ -975,6 +1055,14 @@ public class AutoSandOrders implements ClientModInitializer {
     /** Mua xong -> quay lại sửa xẻng. */
     static void finishBuy(Minecraft mc, LocalPlayer p) {
         if (mc.screen != null) p.closeContainer();
+        if (buyPearl) {                                  // mua ngọc Ender xong -> AutoMiner tiếp tục ném
+            buyPearl = false;
+            msg(p, "Đã mua ngọc Ender, hiện có " + countItem(p, Items.ENDER_PEARL) + ".");
+            state = S.MINING;
+            cooldown = 5;
+            startMining(p);
+            return;
+        }
         if (buyFood) {                                   // mua đồ ăn xong -> ăn luôn
             buyFood = false;
             foodBuyFails = 0;
@@ -1022,9 +1110,104 @@ public class AutoSandOrders implements ClientModInitializer {
                 msg(p, "Mua đồ ăn lỗi 3 lần, đã tắt tự mua đồ ăn. Kiểm tra lại ô /shop -> FOOD.");
             }
         }
+        if (buyPearl) { AutoMiner.pearlBuyFails++; buyPearl = false; }
         buyFood = false;
         state = S.MINING;
         cooldown = 200;
+    }
+
+    // ----------------------------- BỔ SUNG: NUKER / XẾP THANH CÔNG CỤ / THỐNG KÊ -----------------------------
+    static Boolean nukerState = null;       // trạng thái Nuker đã gửi lệnh (tránh gửi lặp mỗi lần đổi trạng thái)
+
+    static void setNuker(LocalPlayer p, boolean on) {
+        if (nukerState != null && nukerState == on) return;
+        nukerState = on;
+        send(p, on ? NUKER_ON : NUKER_OFF);
+    }
+
+    /** Ô thanh công cụ dùng để ném bình XP: ô 4-9 đang có bình; không có thì ô 4. */
+    static int bottleSlot(LocalPlayer p) {
+        for (int i = 3; i < 9; i++) {
+            if (p.getInventory().getItem(i).is(Items.EXPERIENCE_BOTTLE)) return i;
+        }
+        for (int i = 0; i < 3; i++) {
+            if (p.getInventory().getItem(i).is(Items.EXPERIENCE_BOTTLE)) return i;
+        }
+        return 3;
+    }
+
+    /** Bố cục chuẩn: ô1 xẻng, ô2 cà rốt vàng, ô3 cát, ô4-9 bình XP. */
+    static boolean correctAt(int slot, ItemStack st) {
+        if (st.isEmpty()) return false;
+        return switch (slot) {
+            case 0 -> st.is(ItemTags.SHOVELS);
+            case 1 -> st.is(Items.GOLDEN_CARROT);
+            case 2 -> st.is(Items.SAND);
+            default -> st.is(Items.EXPERIENCE_BOTTLE);
+        };
+    }
+
+    /** Được phép vứt (không phải xẻng / bình XP / cà rốt vàng / ngọc Ender). */
+    static boolean droppable(ItemStack st) {
+        return !st.isEmpty() && !st.is(Items.EXPERIENCE_BOTTLE) && !st.is(ItemTags.SHOVELS)
+            && !st.is(Items.GOLDEN_CARROT) && !st.is(Items.ENDER_PEARL);
+    }
+
+    /** Ô 4-9 đầu tiên chứa thứ không phải bình XP và vứt được (cát, đồ khác); -1 nếu sạch. */
+    static int buyDropSlot(LocalPlayer p) {
+        for (int i = 3; i < 9; i++) {
+            if (droppable(p.getInventory().getItem(i))) return i;
+        }
+        return -1;
+    }
+
+    /**
+     * Một thao tác xếp thanh công cụ: trả về {ô nguồn (0-35), ô đích (0-8)} hoặc null nếu đã xong / không còn gì để xếp.
+     * Mỗi lần xếp làm tăng số ô đúng chỗ và không làm ô nào đang đúng thành sai nên không bao giờ lặp vô hạn.
+     */
+    static int[] arrangeMove(LocalPlayer p) {
+        var inv = p.getInventory();
+        for (int i = 0; i < 9; i++) {
+            if (correctAt(i, inv.getItem(i))) continue;
+            int src = -1;
+            double bestPct = -1;
+            for (int j = 0; j < 36; j++) {
+                if (j == i) continue;
+                ItemStack st = inv.getItem(j);
+                if (!correctAt(i, st)) continue;
+                if (j < 9 && correctAt(j, st)) continue;            // món đó đang nằm đúng chỗ của nó rồi
+                double pct = i == 0 ? remainingPct(st) : 0;         // xẻng: lấy cái còn bền nhất
+                if (src < 0 || pct > bestPct + 0.001 || (pct == bestPct && j >= 9 && src < 9)) { src = j; bestPct = pct; }
+            }
+            if (src >= 0) return new int[] {src, i};
+        }
+        return null;
+    }
+
+    /** Hết ngọc Ender -> /shop -> GEAR -> Ngọc Ender -> xác nhận (chạy trong lúc AutoMiner đang đi về chỗ chết). */
+    static void beginPearlBuy(Minecraft mc, LocalPlayer p, int need) {
+        stopMining(mc, p);
+        msg(p, "Chết xa -> mua ngọc Ender ở /shop để ném tới chỗ chết.");
+        buyFood = false;
+        buyPearl = true;
+        pearlNeed = Math.max(1, need);
+        buyRound = 0;
+        buyTarget = Math.max(1, Math.min(4, need));
+        buyRetry = 0;
+        gone = 0;
+        send(p, "/" + SHOP_COMMAND);
+        state = S.BUY_SHOP;
+        timeout = STEP_TIMEOUT;
+        wait = ACTION_DELAY;
+    }
+
+    static String fmtTime(long ticks) {
+        long s = ticks / 20;
+        return String.format(Locale.ROOT, "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60);
+    }
+
+    static String fmtMoney() {
+        return String.format(Locale.ROOT, "%,.0f $", statSand * pricePerSand);
     }
 
     // ----------------------------- HÀM PHỤ: TÚI ĐỒ -----------------------------
@@ -1043,8 +1226,8 @@ public class AutoSandOrders implements ClientModInitializer {
     static void dropStack(Minecraft mc, LocalPlayer p, int invIdx) {
         ItemStack st = p.getInventory().getItem(invIdx);
         if (st.isEmpty()) return;
-        // CHỐT AN TOÀN: tuyệt đối không vứt đồ ăn, bình XP, xẻng (thanh công cụ chỉ vứt cát để lấy chỗ mua bình XP)
-        if (st.has(DataComponents.FOOD) || st.is(Items.EXPERIENCE_BOTTLE) || st.is(ItemTags.SHOVELS)) return;
+        // CHỐT AN TOÀN: tuyệt đối không vứt bình XP, xẻng, cà rốt vàng, ngọc Ender
+        if (!droppable(st)) return;
         mc.gameMode.handleInventoryMouseClick(p.inventoryMenu.containerId, menuSlot(invIdx), 1, ClickType.THROW, p);
     }
 
@@ -1073,12 +1256,13 @@ public class AutoSandOrders implements ClientModInitializer {
         return st.is(Items.SAND)
             || st.is(Items.EXPERIENCE_BOTTLE)
             || st.is(ItemTags.SHOVELS)
-            || st.has(DataComponents.FOOD);
+            || st.is(Items.GOLDEN_CARROT)
+            || st.is(Items.ENDER_PEARL);
     }
 
-    /** Ô (9-35) đầu tiên chứa đồ cần vứt; -1 nếu không có. Không đụng thanh công cụ (0-8), giáp và tay trái. */
+    /** Ô (0-35, gồm cả thanh công cụ) đầu tiên chứa đồ cần vứt; -1 nếu không có. Không đụng giáp và tay trái. */
     static int junkSlot(LocalPlayer p) {
-        for (int i = 9; i < 36; i++) {
+        for (int i = 0; i < 36; i++) {
             ItemStack st = p.getInventory().getItem(i);
             if (!st.isEmpty() && !keepItem(st)) return i;
         }
@@ -1116,6 +1300,7 @@ public class AutoSandOrders implements ClientModInitializer {
 
     /** Số hàng đang mua (đồ ăn hoặc bình XP) để biết hàng đã về chưa. */
     static int boughtCount(LocalPlayer p) {
+        if (buyPearl) return countItem(p, Items.ENDER_PEARL);
         return buyFood ? countFood(p) : countItem(p, Items.EXPERIENCE_BOTTLE);
     }
 
@@ -1152,7 +1337,7 @@ public class AutoSandOrders implements ClientModInitializer {
     /** Số bình XP còn thiếu để thanh công cụ đầy: ô trống = 1 stack, ô bình chưa đủ stack = phần thiếu. */
     static int hotbarMissing(LocalPlayer p) {
         int need = 0;
-        for (int i = 0; i < 9; i++) {
+        for (int i = 3; i < 9; i++) {                       // chỉ tính ô 4-9
             ItemStack st = p.getInventory().getItem(i);
             if (st.isEmpty()) need += 64;
             else if (st.is(Items.EXPERIENCE_BOTTLE)) need += st.getMaxStackSize() - st.getCount();
@@ -1275,6 +1460,121 @@ public class AutoSandOrders implements ClientModInitializer {
 
     static void msg(LocalPlayer p, String t) {
         p.displayClientMessage(Component.literal("[AutoSand] " + t), false);
+    }
+
+    // ============================== VỀ SẢNH (BỊ KICK) -> QUAY LẠI KINGSMP ==============================
+    /**
+     * Bị kick văng ra sảnh: trong túi chỉ còn đồ của sảnh (có la bàn, không còn xẻng nào).
+     * Khi đó: cầm la bàn -> chuột phải mở menu -> bấm KingSMP -> chờ vào lại (có xẻng trở lại) -> đào tiếp.
+     */
+    static final class Lobby {
+        private Lobby() { }
+
+        static int ph = 0, t = 0, seen = 0, tries = 0, to = 0;
+
+        static void reset() { ph = 0; t = 0; seen = 0; tries = 0; to = 0; }
+
+        static boolean isCompass(ItemStack st) {
+            return !st.isEmpty() && (st.is(Items.COMPASS) || nameHas(st, "la ban", "compass"));
+        }
+
+        static int compassSlot(LocalPlayer p) {
+            for (int i = 0; i < 9; i++) {
+                if (isCompass(p.getInventory().getItem(i))) return i;
+            }
+            return -1;
+        }
+
+        static boolean inLobby(LocalPlayer p) {
+            if (AutoMiner.recovering() || AutoMiner.deathRecorded) return false;
+            if (compassSlot(p) < 0) return false;
+            return !AutoMiner.hasAnyShovel(p);
+        }
+
+        /** true = đang xử lý sảnh, bỏ qua phần còn lại của tick. */
+        static boolean tick(Minecraft mc, LocalPlayer p) {
+            if (!autoRejoin) return false;
+            if (ph == 0) {
+                if (inLobby(p)) {
+                    if (++seen >= 20) begin(mc, p);
+                } else {
+                    seen = 0;
+                }
+                return ph != 0;
+            }
+            if (!inLobby(p)) { finish(mc, p); return true; }
+            if (t > 0) { t--; return true; }
+            switch (ph) {
+                case 1 -> {                                   // cầm la bàn
+                    int slot = compassSlot(p);
+                    if (slot < 0) { reset(); return false; }
+                    if (mc.screen != null) { p.closeContainer(); t = 5; return true; }
+                    setSelected(p, slot);
+                    ph = 2;
+                    t = 6;
+                }
+                case 2 -> {                                   // chuột phải
+                    mc.gameMode.useItem(p, InteractionHand.MAIN_HAND);
+                    p.swing(InteractionHand.MAIN_HAND);
+                    ph = 3;
+                    to = 100;
+                }
+                case 3 -> {                                   // chờ menu rồi bấm KingSMP
+                    ChestMenu h = container(mc);
+                    if (h != null && loaded(h)) {
+                        int i = find(h, st -> nameHas(st, "kingsmp", "king smp"), -1);
+                        if (i < 0) i = KING_SLOT;
+                        click(mc, p, h, i, ClickType.PICKUP);
+                        ph = 4;
+                        t = 20;
+                        to = 400;
+                    } else if (--to <= 0) {
+                        retry(mc, p);
+                    }
+                }
+                case 4 -> {                                   // chờ vào lại server
+                    if (--to <= 0) retry(mc, p);
+                }
+                default -> reset();
+            }
+            return true;
+        }
+
+        static void begin(Minecraft mc, LocalPlayer p) {
+            stopMining(mc, p);
+            guardReset(mc, p);
+            state = S.MINING;
+            wait = 0;
+            cooldown = 0;
+            if (mc.screen != null) p.closeContainer();
+            ph = 1;
+            t = 30;
+            msg(p, "Đang ở sảnh -> bấm la bàn chọn KingSMP để quay lại.");
+        }
+
+        static void retry(Minecraft mc, LocalPlayer p) {
+            if (mc.screen != null) p.closeContainer();
+            if (++tries >= 8) {
+                msg(p, "Thử quay lại KingSMP 8 lần không được. Tắt AutoSand.");
+                setEnabled(mc, false);
+                return;
+            }
+            msg(p, "Chưa vào lại được KingSMP, thử lần " + (tries + 1) + "/8.");
+            ph = 1;
+            t = 40;
+        }
+
+        static void finish(Minecraft mc, LocalPlayer p) {
+            reset();
+            if (mc.screen != null) p.closeContainer();
+            AutoMiner.stop(mc);
+            AutoMiner.baseY = -1000000;
+            nukerState = null;
+            state = S.MINING;
+            cooldown = 100;
+            reviveIn = 100;                                   // chờ thế giới tải rồi đào tiếp
+            msg(p, "Đã quay lại KingSMP, đào tiếp.");
+        }
     }
 
     // ============================== HỆ THỐNG KEY (LICENSE) ==============================
@@ -2054,6 +2354,7 @@ public class AutoSandOrders implements ClientModInitializer {
     /** Trạng thái hiện tại bằng chữ dễ hiểu (hiện ở tab Chính). */
     static String stateText() {
         if (!enabled) return "Đang tắt";
+        if (Lobby.ph != 0) return "Đang ở sảnh -> quay lại KingSMP";
         if (mode == Mode.BUILTIN && AutoMiner.recovering()) return AutoMiner.recoverText();
         if (state == S.MINING && guard != G.NONE) {
             return switch (guard) {
@@ -2070,7 +2371,7 @@ public class AutoSandOrders implements ClientModInitializer {
             case WAIT_ORDERS, WAIT_DELIVER, DEPOSIT, WAIT_CONFIRM, FINISH -> "Đang giao cát vào đơn";
             case MEND_PREP, MEND_THROW, MEND_RESTORE -> "Đang sửa xẻng bằng bình XP";
             case BUY_PREP, BUY_SHOP, BUY_GEAR, BUY_AMOUNT, BUY_CONFIRM, BUY_DONE ->
-                buyFood ? "Đang mua đồ ăn" : "Đang mua bình XP";
+                buyPearl ? "Đang mua ngọc Ender" : buyFood ? "Đang mua đồ ăn" : "Đang mua bình XP";
             case EAT_PREP, EAT_USE -> "Đang ăn";
             case JUNK -> "Đang dọn đồ không cần";
         };
@@ -2113,8 +2414,8 @@ public class AutoSandOrders implements ClientModInitializer {
 
     static class AutoSandScreen extends Screen {
         static final int PW = 392, SIDE = 94;
-        static final String[] TABS = {"Chính", "Đào cát", "Sinh tồn", "An toàn", "Key", "Tự đào"};
-        static final int[] TAB_COL = {0xFF3B82F6, 0xFFF59E0B, 0xFF22C55E, 0xFFEF4444, 0xFFA855F7, 0xFF14B8A6};
+        static final String[] TABS = {"Chính", "Đào cát", "Sinh tồn", "An toàn", "Key", "Tự đào", "Thống kê"};
+        static final int[] TAB_COL = {0xFF3B82F6, 0xFFF59E0B, 0xFF22C55E, 0xFFEF4444, 0xFFA855F7, 0xFF14B8A6, 0xFFEC4899};
         static final int TXT = 0xFFFFFFFF, MUTED = 0xFF8A94A6;
 
         /** Một điều khiển tự vẽ (nút thật của game nằm bên dưới, trong suốt, chỉ để nhận chuột). */
@@ -2173,7 +2474,7 @@ public class AutoSandOrders implements ClientModInitializer {
 
             for (int i = 0; i < TABS.length; i++) {
                 final int t = i;
-                Ctl c = add(4, x0 + 8, y0 + 44 + i * 28, SIDE - 14, 24, TABS[i], null, () -> { tab = t; rebuildWidgets(); });
+                Ctl c = add(4, x0 + 8, y0 + 44 + i * 27, SIDE - 14, 24, TABS[i], null, () -> { tab = t; rebuildWidgets(); });
                 c.selected = (i == tab);
                 c.color = TAB_COL[i];
             }
@@ -2193,7 +2494,7 @@ public class AutoSandOrders implements ClientModInitializer {
                     toggle(1, "Nuker", "Phá khối xung quanh bằng Nuker", () -> useNuker, v -> {
                         Minecraft mc = Minecraft.getInstance();
                         useNuker = v;
-                        if (enabled && state == S.MINING && mc.player != null) send(mc.player, useNuker ? NUKER_ON : NUKER_OFF);
+                        if (enabled && state == S.MINING && mc.player != null) { nukerState = null; setNuker(mc.player, useNuker); }
                     });
                     toggle(2, "Giữ phím tiến", "Chế độ Giữ phím: tự giữ W đi tới", () -> keysForward, v -> keysForward = v);
                     cycle(3, "Nhặt cát", "Ưu tiên nhặt cát rơi quanh bạn", AutoSandOrders::pickupLabel, () -> {
@@ -2237,16 +2538,35 @@ public class AutoSandOrders implements ClientModInitializer {
                     toggle(2, "Né hố & tự leo", "Rơi xuống hố -> tự đặt block leo lên", () -> avoidHole, v -> avoidHole = v);
                 }
                 case 5 -> {
-                    begin(4);
+                    begin(6);
                     toggle(0, "Chết -> về nhặt đồ", "Hồi sinh -> /home -> về chỗ chết nhặt lại đồ", () -> AutoMiner.deathRecover, v -> AutoMiner.deathRecover = v);
                     toggle(1, "Tự hồi sinh", "Chết thì tự bấm nút Hồi sinh", () -> AutoMiner.autoRespawn, v -> AutoMiner.autoRespawn = v);
-                    toggle(2, "Đào xuyên khi đi", "Cát / đất chắn đường thì đào qua", () -> AutoMiner.digThrough, v -> AutoMiner.digThrough = v);
+                    toggle(2, "Đào xuyên cát khi đi", "Cát chắn đường: có xẻng đào, không thì vòng", () -> AutoMiner.digThrough, v -> AutoMiner.digThrough = v);
                     cycle(3, "Phạm vi tìm cát", "Tìm cát trong bán kính này", () -> AutoMiner.scanRadius + " ô", () -> {
                         int next = AutoMiner.SCAN_LEVELS[0];
                         for (int v : AutoMiner.SCAN_LEVELS) {
                             if (v > AutoMiner.scanRadius) { next = v; break; }
                         }
                         AutoMiner.scanRadius = next;
+                    });
+                    toggle(4, "Bị kick -> về KingSMP", "Ra sảnh: bấm la bàn chọn KingSMP, đào tiếp", () -> autoRejoin, v -> autoRejoin = v);
+                    toggle(5, "Dùng ngọc Ender", "Chết xa: mua ngọc ở /shop, ném tới chỗ chết", () -> usePearl, v -> usePearl = v);
+                }
+                case 6 -> {
+                    Ctl c1 = add(1, cx, cy + 124, cw, 24, "Giá ước tính mỗi cát", null, () -> {
+                        double next = PRICE_LEVELS[0];
+                        for (double v : PRICE_LEVELS) {
+                            if (v > pricePerSand + 0.0001) { next = v; break; }
+                        }
+                        pricePerSand = next;
+                        save();
+                    });
+                    c1.value = () -> pricePerSand + " $";
+                    add(2, cx, cy + 152, cw, 22, "Đặt lại thống kê", null, () -> {
+                        statSand = 0;
+                        statTicks = 0;
+                        statDeaths = 0;
+                        save();
                     });
                 }
                 default -> add(2, cx, cy + 40, cw, 28, "Dán key từ clipboard", null, () -> {
@@ -2341,13 +2661,13 @@ public class AutoSandOrders implements ClientModInitializer {
                 bullet(g, "Bị nước bao quanh: đặt cát bắc cầu vào bờ.", cx + 10, iy + 22);
                 bullet(g, "Rơi xuống hố: nhảy + đặt cát để leo, không đào lên.", cx + 10, iy + 36);
                 bullet(g, "Né nước/hố phía trước: chỉ ở chế độ ngoài Baritone.", cx + 10, iy + 50);
-            } else if (tab == 5) {
-                int iy = cardY(4) + 6;
-                rrect(g, cx, iy, cw, 50, 4, 0xFF252F45);
-                rrect(g, cx + 1, iy + 1, cw - 2, 48, 3, 0xFF182032);
-                bullet(g, "Sau khi chết: /" + AutoMiner.homeCmd, cx + 10, iy + 8);
-                bullet(g, AutoMiner.deathText(), cx + 10, iy + 22);
-                bullet(g, "Xong: xẻng về thanh công cụ.", cx + 10, iy + 36);
+            } else if (tab == 6) {
+                int sw = (cw - 4) / 2;
+                stat(g, cx, cy, cw, 36, "Toạ độ chết gần nhất", AutoMiner.lastDeathText == null ? "Chưa chết lần nào" : AutoMiner.lastDeathText, TXT, -1f, 0);
+                stat(g, cx, cy + 40, sw, 36, "Thời gian treo", fmtTime(statTicks), TXT, -1f, 0);
+                stat(g, cx + sw + 4, cy + 40, sw, 36, "Tổng tiền kiếm được", fmtMoney(), 0xFF22C55E, -1f, 0);
+                stat(g, cx, cy + 80, sw, 36, "Cát đã giao", String.valueOf(statSand), TXT, -1f, 0);
+                stat(g, cx + sw + 4, cy + 80, sw, 36, "Số lần chết", String.valueOf(statDeaths), 0xFFEF4444, -1f, 0);
             } else if (tab == 4) {
                 rrect(g, cx, cy, cw, 32, 4, 0xFF252F45);
                 rrect(g, cx + 1, cy + 1, cw - 2, 30, 3, 0xFF182032);
@@ -2436,5 +2756,1098 @@ public class AutoSandOrders implements ClientModInitializer {
         public boolean isPauseScreen() {
             return false;
         }
+    }
+}
+
+/**
+ * Bộ tự đào cát có sẵn trong mod (thay Baritone).
+ *
+ *  - Tự tìm cát lộ thiên gần nhất, tìm đường bằng A* (đi ngang, chéo, bước lên 1 ô, rơi tối đa 3 ô,
+ *    tự đào xuyên cát / đất chắn đường), né lava, nước, xương rồng, lửa, hố sâu.
+ *  - Tự nhặt cát rơi (bán kính lấy từ cấu hình "Nhặt cát" trong GUI).
+ *  - Không thấy cát thì đi thăm dò sang chỗ khác.
+ *  - Chết: ghi nhớ toạ độ chết -> tự hồi sinh -> /home cat -> đi về chỗ chết -> nhặt hết đồ rơi
+ *    -> đưa xẻng về thanh công cụ, cát về túi, trả đồ về đúng ô cũ -> đào tiếp.
+ *
+ * Mọi thứ chạy trên client tick của AutoSandOrders (xem AutoSandOrders.tick).
+ */
+final class AutoMiner {
+    private AutoMiner() { }
+
+    // ===================== CẤU HÌNH (lưu trong autosand.properties) =====================
+    static String homeCmd = "home cat";     // lệnh quay lại sau khi chết (không có dấu /)
+    static boolean deathRecover = true;     // chết -> về chỗ chết nhặt đồ
+    static boolean autoRespawn = true;      // tự bấm "Hồi sinh"
+    static boolean digThrough = true;       // cho phép đào xuyên cát / đất chắn đường
+    static int scanRadius = 16;             // bán kính tìm cát
+    static final int[] SCAN_LEVELS = {8, 12, 16, 24};
+
+    // ===================== HẰNG SỐ =====================
+    static final double REACH = 4.3;        // tầm với khi đào (vanilla 4.5, chừa dư)
+    static final double EYE_H = 1.62;
+    static final int MAX_NODES = 2500;      // số ô tối đa A* duyệt mỗi lần tìm đường
+    static final int MAX_RANGE = 48;        // A* không đi xa hơn bấy nhiêu ô so với chỗ xuất phát
+    static final int FALL_MAX = 3;          // rơi tối đa bấy nhiêu ô (3 ô = không mất máu)
+    static final double DIG_COST = 5.0;     // "giá" của việc đào 1 khối khi đi
+    static final int MINE_TIMEOUT = 160;    // đào 1 khối quá bấy nhiêu tick thì bỏ qua
+    static final int TRAVEL_TIMEOUT = 500;  // đi 1 đoạn quá bấy nhiêu tick thì bỏ
+    static final int MAX_DEPTH = 6;         // không đào sâu hơn mức bắt đầu quá bấy nhiêu ô
+    static final int COLLECT_R = 12;        // bán kính nhặt đồ quanh chỗ chết
+    static final int RECOVER_TIMEOUT = 9000; // 7.5 phút: quá thì bỏ nhặt đồ
+    static final int RECOVER_NODES = 6000;  // A* duyệt nhiều ô hơn khi đi vòng tường lúc về chỗ chết
+    static final int HOME_STILL = 200;      // đứng yên 10 giây sau /home
+    static final double PEARL_MIN_DIST = 60;   // chết xa hơn bấy nhiêu ô mới dùng ngọc Ender
+    static final double PEARL_STOP_DIST = 12;  // còn gần hơn bấy nhiêu ô thì đi bộ nốt
+    static final double PEARL_RANGE = 45;      // mỗi lần ném nhắm tối đa bấy nhiêu ô
+    static final float PEARL_MIN_HP = 12f;     // ngọc Ender gây 5 sát thương: máu >= 12 (6 tim) mới ném
+    static final int PEARL_MAX_THROWS = 4;
+
+    /** Chỉ cát mới đào xuyên khi đi (và chỉ khi có xẻng trên thanh công cụ). Khối khác chắn đường thì đi vòng. */
+    static final Set<Block> DIGGABLE = Set.of(
+        Blocks.SAND, Blocks.RED_SAND);
+
+    // ===================== TRẠNG THÁI ĐÀO =====================
+    static final int P_IDLE = 0, P_MOVE = 1, P_MINE = 2, P_ITEM = 3, P_EXPLORE = 4;
+    static final int RUN = 0, DONE = 1, FAIL = 2;
+
+    static boolean active = false;
+    static int ph = P_IDLE, phTicks = 0, stuck = 0, scanCool = 0, noTarget = 0, exploreCount = 0, ignoreAge = 0;
+    static int baseY = -1000000;
+    static BlockPos target = null;
+    static ItemEntity itemTarget = null;
+    static List<BlockPos> path = null;
+    static int pi = 0;
+    static Vec3 lastPos = null;
+    static double exploreYaw = 0;
+    static long failKey = Long.MIN_VALUE;
+    static int failCount = 0;
+    static final Set<Long> ignoreBlocks = new HashSet<>();
+    static final Set<Integer> ignoreItems = new HashSet<>();
+
+    // ===================== TRẠNG THÁI HỒI SINH / NHẶT ĐỒ =====================
+    static final int R_NONE = 0, R_WAIT = 1, R_HOME = 2, R_WALK = 3, R_COLLECT = 4, R_ORG = 5, R_PEARL = 6;
+    static int rec = R_NONE, recTimer = 0, recTicks = 0, recStep = 0, homeTries = 0;
+    static int walkNoProg = 0, walkFails = 0, blindTicks = 0, collectIdle = 0, collectTicks = 0, itemWait = 0;
+    static double walkBest = Double.MAX_VALUE;
+    static boolean deathRecorded = false, shovelWarned = false;
+    static BlockPos deathPos = null;
+    static Object deathDim = null;
+    static int deadTicks = 0;
+    static Vec3 homeFrom = null, itemPlanPos = null;
+    static String lastDeathText = null;
+    static float pearlYaw = 0f, pearlPitch = 0f;
+    static boolean deathMarker = false;       // đang hiện mũi tên chỉ đường tới chỗ chết
+    static boolean gotShovel = false;         // đã nhặt lại được xẻng trong lần nhặt đồ này
+    static boolean teleported = false, canDig = false, pearlDone = false;
+    static int pearlBuyFails = 0, pearlThrows = 0, pearlStep = 0, pearlTimer = 0, pearlHpWait = 0, arrowCnt = 0;
+
+    // Bố cục thanh công cụ lúc còn sống: để chết xong trả đồ về đúng ô cũ
+    static final Item[] snap = new Item[9];
+    static final boolean[] snapShovel = new boolean[9];
+    static int snapTick = 0;
+
+    // ----------------------------- ĐIỀU KHIỂN TỪ AutoSandOrders -----------------------------
+    static void start(LocalPlayer p) {
+        active = true;
+        int y = p.blockPosition().getY();
+        if (y > baseY) baseY = y;
+        if (rec == R_NONE) { path = null; target = null; itemTarget = null; ph = P_IDLE; phTicks = 0; stuck = 0; }
+    }
+
+    static void stop(Minecraft mc) {
+        active = false;
+        path = null;
+        target = null;
+        itemTarget = null;
+        ph = P_IDLE;
+        phTicks = 0;
+        release(mc);
+    }
+
+    /** Tắt hẳn (người dùng bấm TẮT / BẬT): xoá luôn việc đang nhặt đồ. */
+    static void reset(Minecraft mc) {
+        stop(mc);
+        rec = R_NONE;
+        deathRecorded = false;
+        baseY = -1000000;
+        noTarget = 0;
+        exploreCount = 0;
+        ignoreBlocks.clear();
+        ignoreItems.clear();
+    }
+
+    static boolean recovering() { return rec != R_NONE; }
+
+    static void release(Minecraft mc) {
+        mc.options.keyUp.setDown(false);
+        mc.options.keyJump.setDown(false);
+        mc.options.keySprint.setDown(false);
+        mc.options.keyAttack.setDown(false);
+    }
+
+    // ----------------------------- CHẾT / HỒI SINH -----------------------------
+    /** Gọi mỗi tick khi người chơi đang chết. */
+    static void onDead(Minecraft mc, LocalPlayer p) {
+        release(mc);
+        // Chết lần đầu, hoặc chết lại sau khi đã nhặt được xẻng -> ghi toạ độ mới.
+        // Chết giữa đường khi CHƯA nhặt được xẻng -> giữ toạ độ cũ (đồ vẫn nằm ở chỗ cũ), tiếp tục đi tới đó.
+        if (!deathRecorded || gotShovel) {
+            deathRecorded = true;
+            gotShovel = false;
+            deadTicks = 0;
+            deathPos = p.blockPosition();
+            deathDim = mc.level != null ? mc.level.dimension() : null;
+            lastDeathText = deathPos.getX() + " " + deathPos.getY() + " " + deathPos.getZ();
+            deathMarker = true;
+            AutoSandOrders.statDeaths++;
+            AutoSandOrders.save();
+            AutoSandOrders.msg(p, "Đã chết tại " + lastDeathText + " (đã ghi nhớ toạ độ).");
+        }
+        if (autoRespawn && ++deadTicks % 20 == 10) p.respawn();
+    }
+
+    /** Gọi khi LocalPlayer mới xuất hiện sau khi chết / vào lại thế giới. */
+    static void onRespawn(Minecraft mc, LocalPlayer p) {
+        path = null;
+        target = null;
+        itemTarget = null;
+        ph = P_IDLE;
+        release(mc);
+        baseY = -1000000;
+        if (deathRecorded && deathPos != null) {
+            rec = R_WAIT;
+            recTimer = 40;
+            recTicks = 0;
+            recStep = 0;
+            homeTries = 0;
+            walkNoProg = 0;
+            walkFails = 0;
+            blindTicks = 0;
+            walkBest = Double.MAX_VALUE;
+            collectIdle = 0;
+            shovelWarned = false;
+            pearlDone = false;
+            pearlBuyFails = 0;
+            teleported = false;
+            ignoreItems.clear();
+            AutoSandOrders.msg(p, "Đã hồi sinh. Chuẩn bị /" + homeCmd + ", đứng yên 10 giây rồi mới đi tiếp.");
+        } else {
+            deathRecorded = false;
+        }
+    }
+
+    static String deathText() {
+        return lastDeathText == null ? "Chưa chết lần nào" : "Chết ở " + lastDeathText;
+    }
+
+    static String recoverText() {
+        return switch (rec) {
+            case R_WAIT -> "Vừa hồi sinh, chuẩn bị về home";
+            case R_HOME -> "Chờ /" + homeCmd + " dịch chuyển";
+            case R_WALK -> "Đang đi về chỗ chết";
+            case R_COLLECT -> "Đang nhặt đồ rơi lúc chết";
+            case R_ORG -> "Đang xếp xẻng / đồ lên thanh công cụ";
+            case R_PEARL -> "Đang ném ngọc Ender tới chỗ chết";
+            default -> "Đang đào cát";
+        };
+    }
+
+    // ----------------------------- TICK CHÍNH -----------------------------
+    static void tick(Minecraft mc, LocalPlayer p) {
+        ClientLevel lv = mc.level;
+        if (lv == null) return;
+        canDig = digThrough && hotbarShovel(p) >= 0;          // không có xẻng thì không đào xuyên, đi vòng
+        if (rec != R_NONE) { tickRecovery(mc, p, lv); return; }
+        if (!active) return;
+        phTicks++;
+        if (scanCool > 0) scanCool--;
+        switch (ph) {
+            case P_IDLE -> chooseAction(mc, p, lv);
+            case P_MOVE, P_ITEM, P_EXPLORE -> tickTravel(mc, p, lv);
+            case P_MINE -> tickMine(mc, p, lv);
+            default -> ph = P_IDLE;
+        }
+    }
+
+    /** Ghi lại bố cục thanh công cụ (chỉ khi đang có xẻng trên đó, để khỏi ghi nhầm lúc đang sửa xẻng). */
+    static void snapshot(LocalPlayer p) {
+        if (deathRecorded || rec != R_NONE) return;
+        if (++snapTick < 40) return;
+        snapTick = 0;
+        boolean has = false;
+        for (int i = 0; i < 9; i++) {
+            if (p.getInventory().getItem(i).is(ItemTags.SHOVELS)) has = true;
+        }
+        if (!has) return;
+        for (int i = 0; i < 9; i++) {
+            ItemStack st = p.getInventory().getItem(i);
+            snap[i] = st.isEmpty() ? null : st.getItem();
+            snapShovel[i] = st.is(ItemTags.SHOVELS);
+        }
+    }
+
+    // ----------------------------- CHỌN VIỆC -----------------------------
+    static void chooseAction(Minecraft mc, LocalPlayer p, ClientLevel lv) {
+        release(mc);
+        if (scanCool > 0) return;
+        if (ignoreBlocks.size() > 200 || ++ignoreAge > 1200) {
+            ignoreBlocks.clear();
+            ignoreItems.clear();
+            ignoreAge = 0;
+        }
+
+        // 1) cát rơi gần đó -> đi nhặt
+        if (AutoSandOrders.pickupRadius > 0 && !AutoSandOrders.isFull(p)) {
+            ItemEntity it = findDrop(lv, p, p.position(), AutoSandOrders.pickupRadius, true);
+            if (it != null) {
+                Vec3 ip = it.position();
+                List<BlockPos> r = findPath(lv, p.blockPosition(), ip,
+                    q -> Math.hypot(q.getX() + 0.5 - ip.x, q.getZ() + 0.5 - ip.z) < 0.9 && Math.abs(q.getY() - ip.y) < 2.0,
+                    1200, false);
+                if (r != null && !r.isEmpty()) {
+                    itemTarget = it;
+                    path = r;
+                    pi = 0;
+                    stuck = 0;
+                    ph = P_ITEM;
+                    phTicks = 0;
+                    return;
+                }
+                ignoreItems.add(it.getId());
+            }
+        }
+
+        // 2) khối cát để đào
+        if (planToSand(p, lv)) {
+            noTarget = 0;
+            exploreCount = 0;
+            return;
+        }
+
+        // 3) không còn cát quanh đây -> đi thăm dò chỗ khác
+        baseY = p.blockPosition().getY();
+        if (++exploreCount <= 40 && planExplore(lv, p)) return;
+        scanCool = 40;
+        if (++noTarget >= 10 || exploreCount > 40) {
+            AutoSandOrders.msg(p, "Không tìm thấy cát quanh đây và không thăm dò thêm được. Tắt AutoSand.");
+            AutoSandOrders.setEnabled(mc, false);
+        }
+    }
+
+    static boolean planToSand(LocalPlayer p, ClientLevel lv) {
+        List<BlockPos> cands = scanSand(lv, p);
+        if (cands.isEmpty()) return false;
+        Vec3 eye = p.getEyePosition();
+
+        // đang trong tầm với: đào luôn, khỏi đi
+        for (BlockPos c : cands) {
+            if (canMineFromEye(lv, p, eye, c)) {
+                target = c;
+                path = null;
+                ph = P_MINE;
+                phTicks = 0;
+                return true;
+            }
+        }
+        BlockPos start = p.blockPosition();
+        int tries = 0;
+        for (BlockPos c : cands) {
+            if (tries++ >= 5) break;
+            Vec3 ct = Vec3.atCenterOf(c);
+            List<BlockPos> r = findPath(lv, start, ct, q -> {
+                if (colBlocked(q, c)) return false;
+                Vec3 e = new Vec3(q.getX() + 0.5, q.getY() + EYE_H, q.getZ() + 0.5);
+                return canMineFromEye(lv, p, e, c);
+            }, MAX_NODES, false);
+            if (r != null) {
+                target = c;
+                path = r;
+                pi = 0;
+                stuck = 0;
+                phTicks = 0;
+                ph = r.isEmpty() ? P_MINE : P_MOVE;
+                return true;
+            }
+            ignoreBlocks.add(c.asLong());
+        }
+        return false;
+    }
+
+    static boolean planExplore(ClientLevel lv, LocalPlayer p) {
+        BlockPos start = p.blockPosition();
+        double[] offs = {0, 90, -90, 180, 45, -45};
+        for (double off : offs) {
+            double ang = Math.toRadians(exploreYaw + off);
+            double tx = p.getX() - Math.sin(ang) * 26, tz = p.getZ() + Math.cos(ang) * 26;
+            Vec3 t = new Vec3(tx, p.getY(), tz);
+            List<BlockPos> r = findPath(lv, start, t,
+                q -> Math.hypot(q.getX() + 0.5 - tx, q.getZ() + 0.5 - tz) < 3.0, MAX_NODES, true);
+            if (r != null && r.size() >= 4) {
+                exploreYaw += off;
+                path = r;
+                pi = 0;
+                stuck = 0;
+                ph = P_EXPLORE;
+                phTicks = 0;
+                return true;
+            }
+        }
+        exploreYaw = Math.random() * 360.0;
+        return false;
+    }
+
+    // ----------------------------- QUÉT CÁT -----------------------------
+    static final class Cand {
+        final BlockPos pos;
+        final double score;
+        Cand(BlockPos pos, double score) { this.pos = pos; this.score = score; }
+    }
+
+    /** Tối đa 12 khối cát lộ thiên gần nhất, đã loại các khối nguy hiểm (kề nước / lava, ngay dưới chân, trên đầu). */
+    static List<BlockPos> scanSand(ClientLevel lv, LocalPlayer p) {
+        BlockPos o = p.blockPosition();
+        int r = scanRadius;
+        List<Cand> list = new ArrayList<>();
+        BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
+        for (int dy = -MAX_DEPTH; dy <= 5; dy++) {
+            int y = o.getY() + dy;
+            if (y < baseY - MAX_DEPTH) continue;
+            for (int dx = -r; dx <= r; dx++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    m.set(o.getX() + dx, y, o.getZ() + dz);
+                    if (!lv.getBlockState(m).is(Blocks.SAND)) continue;
+                    if (ignoreBlocks.contains(m.asLong())) continue;
+                    if (underOrOver(p, m)) continue;
+                    boolean open = false, bad = false;
+                    for (Direction d : Direction.values()) {
+                        BlockPos nb = m.relative(d);
+                        BlockState ns = lv.getBlockState(nb);
+                        if (!ns.getFluidState().isEmpty()) { bad = true; break; }
+                        if (ns.getCollisionShape(lv, nb).isEmpty()) open = true;
+                    }
+                    if (bad || !open) continue;
+                    list.add(new Cand(m.immutable(), dx * dx + dz * dz + 3.0 * dy * dy));
+                }
+            }
+        }
+        list.sort(Comparator.comparingDouble((Cand c) -> c.score));
+        List<BlockPos> out = new ArrayList<>();
+        for (int i = 0; i < list.size() && i < 12; i++) out.add(list.get(i).pos);
+        return out;
+    }
+
+    /** Khối nằm ngay dưới chân (đào là rơi) hoặc trên đầu (cát đổ xuống đè) -> không đào. */
+    static boolean underOrOver(LocalPlayer p, BlockPos b) {
+        if (b.getX() + 1 <= p.getX() - 0.35 || b.getX() >= p.getX() + 0.35) return false;
+        if (b.getZ() + 1 <= p.getZ() - 0.35 || b.getZ() >= p.getZ() + 0.35) return false;
+        int fy = p.blockPosition().getY();
+        return b.getY() == fy - 1 || b.getY() >= fy + 2;
+    }
+
+    static boolean colBlocked(BlockPos stand, BlockPos t) {
+        return t.getX() == stand.getX() && t.getZ() == stand.getZ()
+            && (t.getY() == stand.getY() - 1 || t.getY() >= stand.getY() + 2);
+    }
+
+    /** Từ mắt tại eye nhìn thẳng tới khối t: trong tầm với và không bị khối khác che. */
+    static boolean canMineFromEye(ClientLevel lv, LocalPlayer p, Vec3 eye, BlockPos t) {
+        Vec3 c = Vec3.atCenterOf(t);
+        if (eye.distanceToSqr(c) > REACH * REACH) return false;
+        BlockHitResult r = lv.clip(new ClipContext(eye, c, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, p));
+        return r.getType() == HitResult.Type.BLOCK && r.getBlockPos().equals(t);
+    }
+
+    // ----------------------------- ĐỒ RƠI -----------------------------
+    static ItemEntity findDrop(ClientLevel lv, LocalPlayer p, Vec3 c, double r, boolean sandOnly) {
+        AABB box = new AABB(c.x - r, c.y - 5, c.z - r, c.x + r, c.y + 5, c.z + r);
+        List<ItemEntity> list = lv.getEntitiesOfClass(ItemEntity.class, box,
+            e -> !e.isRemoved() && (!sandOnly || e.getItem().is(Items.SAND)) && !ignoreItems.contains(e.getId()));
+        ItemEntity best = null;
+        double bd = Double.MAX_VALUE;
+        for (ItemEntity e : list) {
+            double dx = e.getX() - p.getX(), dz = e.getZ() - p.getZ();
+            double d = dx * dx + dz * dz;
+            if (sandOnly && d < 1.2 * 1.2 && Math.abs(e.getY() - p.getY()) < 1.5) continue;   // quá gần: tự nhặt được
+            if (d < bd) { bd = d; best = e; }
+        }
+        return best;
+    }
+
+    // ----------------------------- ĐI / ĐÀO -----------------------------
+    static void tickTravel(Minecraft mc, LocalPlayer p, ClientLevel lv) {
+        if (phTicks > TRAVEL_TIMEOUT) { failTravel(mc); return; }
+        if (ph == P_ITEM) {
+            if (itemTarget == null || itemTarget.isRemoved() || AutoSandOrders.isFull(p)) { endTravel(mc); return; }
+        } else if (ph == P_MOVE) {
+            if (target == null || !lv.getBlockState(target).is(Blocks.SAND)) { endTravel(mc); return; }
+        }
+        int r = followPath(mc, p, lv);
+        if (r == RUN) return;
+        release(mc);
+        if (r == FAIL) { failTravel(mc); return; }
+        if (ph == P_MOVE) {                                  // tới nơi -> đào
+            path = null;
+            ph = P_MINE;
+            phTicks = 0;
+            return;
+        }
+        if (ph == P_ITEM && itemTarget != null && !itemTarget.isRemoved()) ignoreItems.add(itemTarget.getId());
+        endTravel(mc);
+    }
+
+    static void failTravel(Minecraft mc) {
+        if (ph == P_MOVE && target != null) ignoreBlocks.add(target.asLong());
+        if (ph == P_ITEM && itemTarget != null) ignoreItems.add(itemTarget.getId());
+        endTravel(mc);
+    }
+
+    static void endTravel(Minecraft mc) {
+        release(mc);
+        path = null;
+        itemTarget = null;
+        target = null;
+        ph = P_IDLE;
+        phTicks = 0;
+        scanCool = 2;
+    }
+
+    static void tickMine(Minecraft mc, LocalPlayer p, ClientLevel lv) {
+        release(mc);
+        BlockPos t = target;
+        if (t == null || !lv.getBlockState(t).is(Blocks.SAND)) {        // đào xong
+            target = null;
+            ph = P_IDLE;
+            phTicks = 0;
+            scanCool = 0;
+            return;
+        }
+        if (phTicks > MINE_TIMEOUT || underOrOver(p, t)) {
+            ignoreBlocks.add(t.asLong());
+            target = null;
+            ph = P_IDLE;
+            phTicks = 0;
+            scanCool = 2;
+            return;
+        }
+        if (!canMineFromEye(lv, p, p.getEyePosition(), t)) {            // lệch vị trí / bị che -> tính lại, 3 lần liền thì bỏ
+            if (t.asLong() == failKey) failCount++;
+            else { failKey = t.asLong(); failCount = 1; }
+            if (failCount >= 3) { ignoreBlocks.add(t.asLong()); failCount = 0; }
+            target = null;
+            ph = P_IDLE;
+            phTicks = 0;
+            scanCool = 2;
+            return;
+        }
+        digBlock(mc, p, t);
+    }
+
+    static void digBlock(Minecraft mc, LocalPlayer p, BlockPos b) {
+        Vec3 c = Vec3.atCenterOf(b);
+        aimAt(p, c);
+        ensureShovel(p);
+        Vec3 e = p.getEyePosition();
+        Direction face = Direction.getApproximateNearest(e.x - c.x, e.y - c.y, e.z - c.z);
+        mc.gameMode.continueDestroyBlock(b, face);
+        p.swing(InteractionHand.MAIN_HAND);
+    }
+
+    static void aimAt(LocalPlayer p, Vec3 t) {
+        Vec3 e = p.getEyePosition();
+        double dx = t.x - e.x, dy = t.y - e.y, dz = t.z - e.z;
+        p.setYRot((float) Math.toDegrees(Math.atan2(-dx, dz)));
+        p.setXRot((float) -Math.toDegrees(Math.atan2(dy, Math.hypot(dx, dz))));
+    }
+
+    /** Cầm xẻng trên thanh công cụ (nếu đang cầm thứ khác). */
+    static void ensureShovel(LocalPlayer p) {
+        if (p.getInventory().getItem(AutoSandOrders.getSelected(p)).is(ItemTags.SHOVELS)) return;
+        int hs = hotbarShovel(p);
+        if (hs >= 0) AutoSandOrders.setSelected(p, hs);
+    }
+
+    /** Đi theo path[pi...]. Đào khối chắn đường nếu được phép. */
+    static int followPath(Minecraft mc, LocalPlayer p, ClientLevel lv) {
+        if (path == null) return DONE;
+        Vec3 pos = p.position();
+        while (pi < path.size()) {
+            BlockPos q = path.get(pi);
+            double qx = q.getX() + 0.5 - pos.x, qz = q.getZ() + 0.5 - pos.z, qy = pos.y - q.getY();
+            if (Math.hypot(qx, qz) < 0.45 && qy < 1.2 && qy > -1.2) { pi++; stuck = 0; } else break;
+        }
+        if (pi >= path.size()) { release(mc); return DONE; }
+
+        BlockPos n = path.get(pi);
+        double dx = n.getX() + 0.5 - pos.x, dz = n.getZ() + 0.5 - pos.z;
+        double dist = Math.hypot(dx, dz);
+        if (dist > 6.0 || Math.abs(pos.y - n.getY()) > 4.0) return FAIL;     // bị đẩy lệch đường -> tính lại
+
+        // ô cần trống để đi vào n
+        BlockPos from = p.blockPosition();
+        BlockPos blocker = null;
+        if (!AutoSandOrders.passable(lv, n)) blocker = n;
+        else if (!AutoSandOrders.passable(lv, n.above())) blocker = n.above();
+        else if (n.getY() > from.getY() && !AutoSandOrders.passable(lv, from.above(2))) blocker = from.above(2);
+        if (blocker != null) {
+            Block bk = lv.getBlockState(blocker).getBlock();
+            if (!canDig || !DIGGABLE.contains(bk)) return FAIL;
+            if (p.getEyePosition().distanceToSqr(Vec3.atCenterOf(blocker)) > REACH * REACH) return FAIL;
+            release(mc);
+            digBlock(mc, p, blocker);
+            stuck = 0;
+            return RUN;
+        }
+
+        if (dist > 0.12) p.setYRot((float) Math.toDegrees(Math.atan2(-dx, dz)));
+        p.setXRot(0f);
+        boolean dropAhead = n.getY() < pos.y - 1.0;                          // sắp rơi xuống: dừng ở mép cho rơi thẳng
+        mc.options.keyUp.setDown(!(dropAhead && dist < 0.5));
+        boolean jump = (n.getY() > pos.y + 0.3 && dist < 1.7) || (p.horizontalCollision && p.onGround());
+        mc.options.keyJump.setDown(jump);
+        mc.options.keySprint.setDown(dist > 1.2 && !jump && !dropAhead);
+
+        if (lastPos != null && pos.distanceToSqr(lastPos) < 0.0016) {
+            if (++stuck > 40) return FAIL;
+        } else {
+            stuck = 0;
+        }
+        lastPos = pos;
+        return RUN;
+    }
+
+    // ----------------------------- TÌM ĐƯỜNG (A*) -----------------------------
+    static boolean hazardState(BlockState s) {
+        return s.is(Blocks.CACTUS) || s.is(Blocks.FIRE) || s.is(Blocks.SOUL_FIRE) || s.is(Blocks.MAGMA_BLOCK)
+            || s.is(Blocks.SWEET_BERRY_BUSH) || s.is(Blocks.WITHER_ROSE) || s.is(Blocks.POWDER_SNOW)
+            || s.is(Blocks.COBWEB) || s.is(Blocks.CAMPFIRE) || s.is(Blocks.SOUL_CAMPFIRE)
+            || s.getFluidState().is(FluidTags.LAVA);
+    }
+
+    /** -1 = chặn (đá, nước, lava...), 0 = trống đi qua được, DIG_COST = phải đào mới qua. */
+    static double cellCost(ClientLevel lv, BlockPos c) {
+        BlockState s = lv.getBlockState(c);
+        if (hazardState(s) || !s.getFluidState().isEmpty()) return -1;
+        if (s.getCollisionShape(lv, c).isEmpty()) return 0;
+        if (canDig && DIGGABLE.contains(s.getBlock())) return DIG_COST;
+        return -1;
+    }
+
+    /** Khối đứng được: đặc, cao tối đa 1 ô, không phải khối nguy hiểm / chất lỏng. */
+    static boolean solidGround(ClientLevel lv, BlockPos b) {
+        BlockState s = lv.getBlockState(b);
+        if (hazardState(s) || !s.getFluidState().isEmpty()) return false;
+        var sh = s.getCollisionShape(lv, b);
+        return !sh.isEmpty() && sh.max(Direction.Axis.Y) <= 1.0001;
+    }
+
+    static boolean lavaNear(ClientLevel lv, BlockPos f) {
+        if (AutoSandOrders.lavaAt(lv, f.below())) return true;
+        for (Direction d : AutoSandOrders.HORIZ) {
+            BlockPos n = f.relative(d);
+            if (AutoSandOrders.lavaAt(lv, n) || AutoSandOrders.lavaAt(lv, n.above())) return true;
+        }
+        return false;
+    }
+
+    static final class Move {
+        final BlockPos pos;
+        final double cost;
+        Move(BlockPos pos, double cost) { this.pos = pos; this.cost = cost; }
+    }
+
+    static void expand(ClientLevel lv, BlockPos p, List<Move> out) {
+        BlockPos head2 = p.above(2);
+        for (Direction d : AutoSandOrders.HORIZ) {
+            BlockPos n = p.relative(d);
+            double c1 = cellCost(lv, n), c2 = cellCost(lv, n.above());
+
+            // đi ngang, hoặc đi ra mép rồi rơi xuống (tối đa FALL_MAX ô)
+            if (c1 >= 0 && c2 >= 0) {
+                if (solidGround(lv, n.below())) {
+                    if (!lavaNear(lv, n)) out.add(new Move(n, 1.0 + c1 + c2));
+                } else if (c1 == 0 && c2 == 0) {
+                    for (int k = 1; k <= FALL_MAX; k++) {
+                        BlockPos m = n.below(k);
+                        if (cellCost(lv, m) != 0) break;
+                        if (solidGround(lv, m.below())) {
+                            if (!lavaNear(lv, m)) out.add(new Move(m, 1.5 + 0.6 * k));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // bước lên 1 ô (nhảy)
+            if (solidGround(lv, n)) {
+                BlockPos up = n.above();
+                double a = cellCost(lv, head2), b = cellCost(lv, up), c = cellCost(lv, up.above());
+                if (a >= 0 && b >= 0 && c >= 0 && !lavaNear(lv, up)) out.add(new Move(up, 1.8 + a + b + c));
+            }
+        }
+
+        // đi chéo (chỉ khi cả 2 ô kề và ô đích đều thông thoáng, có nền)
+        for (int i = 0; i < 4; i++) {
+            Direction a = AutoSandOrders.HORIZ[i], b = AutoSandOrders.HORIZ[(i + 1) % 4];
+            BlockPos pa = p.relative(a), pb = p.relative(b), dn = pa.relative(b);
+            if (cellCost(lv, pa) == 0 && cellCost(lv, pa.above()) == 0
+                && cellCost(lv, pb) == 0 && cellCost(lv, pb.above()) == 0
+                && cellCost(lv, dn) == 0 && cellCost(lv, dn.above()) == 0
+                && solidGround(lv, pa.below()) && solidGround(lv, pb.below()) && solidGround(lv, dn.below())
+                && !lavaNear(lv, dn)) {
+                out.add(new Move(dn, 1.42));
+            }
+        }
+    }
+
+    static final class Nd {
+        final BlockPos pos;
+        final Nd parent;
+        final double g, f;
+        Nd(BlockPos pos, Nd parent, double g, double f) { this.pos = pos; this.parent = parent; this.g = g; this.f = f; }
+    }
+
+    static double heur(BlockPos n, Vec3 t) {
+        double dx = n.getX() + 0.5 - t.x, dz = n.getZ() + 0.5 - t.z, dy = n.getY() - t.y;
+        return Math.sqrt(dx * dx + dz * dz) + Math.abs(dy) * 0.7;
+    }
+
+    /**
+     * A* từ start tới ô thoả goal. Trả về danh sách ô cần đi qua (không gồm ô xuất phát), rỗng nếu đã ở đích,
+     * null nếu không có đường. partial = true: không tới được đích thì đi tới ô gần đích nhất đã duyệt.
+     */
+    static List<BlockPos> findPath(ClientLevel lv, BlockPos start, Vec3 target, Predicate<BlockPos> goal,
+                                   int maxNodes, boolean partial) {
+        PriorityQueue<Nd> open = new PriorityQueue<>(Comparator.comparingDouble((Nd x) -> x.f));
+        Map<Long, Double> bestG = new HashMap<>();
+        Set<Long> closed = new HashSet<>();
+        Nd s = new Nd(start, null, 0, heur(start, target) * 1.3);
+        open.add(s);
+        bestG.put(start.asLong(), 0.0);
+        Nd best = s;
+        double bestH = heur(start, target);
+        int expanded = 0;
+        List<Move> mv = new ArrayList<>();
+        while (!open.isEmpty() && expanded < maxNodes) {
+            Nd cur = open.poll();
+            if (!closed.add(cur.pos.asLong())) continue;
+            expanded++;
+            if (goal.test(cur.pos)) return build(cur);
+            double h = heur(cur.pos, target);
+            if (h < bestH) { bestH = h; best = cur; }
+            mv.clear();
+            expand(lv, cur.pos, mv);
+            for (Move m : mv) {
+                BlockPos np = m.pos;
+                if (Math.abs(np.getX() - start.getX()) > MAX_RANGE || Math.abs(np.getZ() - start.getZ()) > MAX_RANGE) continue;
+                long k = np.asLong();
+                if (closed.contains(k)) continue;
+                double ng = cur.g + m.cost;
+                Double old = bestG.get(k);
+                if (old != null && old <= ng) continue;
+                bestG.put(k, ng);
+                open.add(new Nd(np, cur, ng, ng + heur(np, target) * 1.3));
+            }
+        }
+        if (partial && best != s) return build(best);
+        return null;
+    }
+
+    static List<BlockPos> build(Nd end) {
+        ArrayList<BlockPos> r = new ArrayList<>();
+        for (Nd n = end; n.parent != null; n = n.parent) r.add(n.pos);
+        Collections.reverse(r);
+        return r;
+    }
+
+    // ----------------------------- NHẶT ĐỒ SAU KHI CHẾT -----------------------------
+    static Vec3 deathCenter() {
+        return new Vec3(deathPos.getX() + 0.5, deathPos.getY(), deathPos.getZ() + 0.5);
+    }
+
+    static void tickRecovery(Minecraft mc, LocalPlayer p, ClientLevel lv) {
+        if (deathPos == null || ++recTicks > RECOVER_TIMEOUT) {
+            endRecovery(mc, p, "quá thời gian, bỏ qua");
+            return;
+        }
+        if (hasAnyShovel(p)) gotShovel = true;
+        Vec3 dc = deathCenter();
+        switch (rec) {
+            case R_WAIT -> {
+                release(mc);
+                if (--recTimer > 0) return;
+                if (homeCmd == null || homeCmd.isBlank()) { rec = deathRecover ? R_WALK : R_HOME; recTimer = deathRecover ? 0 : HOME_STILL; path = null; return; }
+                homeFrom = p.position();
+                teleported = false;
+                AutoSandOrders.send(p, "/" + homeCmd);
+                homeTries++;
+                rec = R_HOME;
+                recTimer = HOME_STILL;                          // đứng yên đủ 10 giây để về home xong
+            }
+            case R_HOME -> {
+                release(mc);                                    // đứng yên (nhiều server huỷ dịch chuyển nếu di chuyển)
+                if (!teleported && homeFrom != null && p.position().distanceToSqr(homeFrom) > 16.0) {
+                    teleported = true;
+                    AutoSandOrders.msg(p, "Đã về home, đứng yên cho đủ 10 giây.");
+                }
+                if (--recTimer > 0) return;
+                double far = Math.hypot(p.getX() - dc.x, p.getZ() - dc.z);
+                if (!teleported && homeTries < 2 && far > 80 && homeCmd != null && !homeCmd.isBlank()) {
+                    homeFrom = p.position();                    // chưa dịch chuyển được -> gửi lại 1 lần
+                    AutoSandOrders.send(p, "/" + homeCmd);
+                    homeTries++;
+                    recTimer = HOME_STILL;
+                    return;
+                }
+                if (!deathRecover) { endRecovery(mc, p, "đã về home (tắt nhặt đồ)"); return; }
+                AutoSandOrders.msg(p, "Đi tới chỗ chết.");
+                rec = R_WALK;
+                recTimer = 20;
+                path = null;
+            }
+            case R_WALK -> {
+                if (recTimer > 0) { recTimer--; release(mc); return; }
+                if (deathDim != null && !deathDim.equals(lv.dimension())) {
+                    endRecovery(mc, p, "đang ở chiều không gian khác với chỗ chết");
+                    return;
+                }
+                double hd = Math.hypot(p.getX() - dc.x, p.getZ() - dc.z);
+                if (hd <= 3.0 && Math.abs(p.getY() - dc.y) <= 4.0) {
+                    release(mc);
+                    rec = R_COLLECT;
+                    collectIdle = 0;
+                    collectTicks = 0;
+                    itemWait = 0;
+                    itemTarget = null;
+                    path = null;
+                    AutoSandOrders.msg(p, "Tới chỗ chết, bắt đầu nhặt đồ.");
+                    return;
+                }
+                if (AutoSandOrders.usePearl && !pearlDone && hd > PEARL_MIN_DIST) {   // chết xa -> dùng ngọc Ender
+                    rec = R_PEARL;
+                    pearlThrows = 0;
+                    pearlStep = 0;
+                    pearlTimer = 0;
+                    pearlHpWait = 0;
+                    return;
+                }
+                if (recTicks % 100 == 0) {                      // 5 giây một lần kiểm tra có tiến gần hơn không
+                    double d = p.position().distanceTo(dc);
+                    if (d > walkBest - 2.0) walkNoProg++; else walkNoProg = 0;
+                    walkBest = Math.min(walkBest, d);
+                    if (walkNoProg >= 6 || walkFails > 12) {
+                        endRecovery(mc, p, "không đi tới được toạ độ chết");
+                        return;
+                    }
+                }
+                if (path == null || pi >= path.size()) {
+                    path = null;
+                    List<BlockPos> rp = findPath(lv, p.blockPosition(), dc,
+                        q -> Math.hypot(q.getX() + 0.5 - dc.x, q.getZ() + 0.5 - dc.z) <= 2.5 && Math.abs(q.getY() - dc.y) <= 3,
+                        RECOVER_NODES, true);
+                    if (rp == null || rp.isEmpty()) {
+                        if (++blindTicks > 600) { endRecovery(mc, p, "không tìm được đường tới chỗ chết"); return; }
+                        blindWalk(mc, p, dc);
+                        return;
+                    }
+                    path = rp;
+                    pi = 0;
+                    stuck = 0;
+                }
+                int r = followPath(mc, p, lv);
+                if (r == FAIL) { path = null; stuck = 0; walkFails++; }
+                else if (r == DONE) path = null;
+            }
+            case R_COLLECT -> {
+                if (++collectTicks > 2400) { toOrganize(mc); return; }
+                if (itemTarget == null || itemTarget.isRemoved()) {
+                    itemTarget = findDrop(lv, p, dc, COLLECT_R, false);
+                    path = null;
+                    itemWait = 0;
+                    if (itemTarget == null) {
+                        release(mc);
+                        if (++collectIdle >= 60) toOrganize(mc);
+                        return;
+                    }
+                    collectIdle = 0;
+                }
+                ItemEntity it = itemTarget;
+                Vec3 ip = it.position();
+                if (path == null) {
+                    itemPlanPos = ip;
+                    List<BlockPos> rp = findPath(lv, p.blockPosition(), ip,
+                        q -> Math.hypot(q.getX() + 0.5 - ip.x, q.getZ() + 0.5 - ip.z) < 0.9 && Math.abs(q.getY() - ip.y) < 2.0,
+                        MAX_NODES, false);
+                    if (rp == null) { ignoreItems.add(it.getId()); itemTarget = null; return; }
+                    path = rp;
+                    pi = 0;
+                    stuck = 0;
+                }
+                int r = followPath(mc, p, lv);
+                if (r == FAIL) {
+                    ignoreItems.add(it.getId());
+                    itemTarget = null;
+                    path = null;
+                    release(mc);
+                } else if (r == DONE) {
+                    release(mc);
+                    if (itemPlanPos != null && ip.distanceToSqr(itemPlanPos) > 2.25) { path = null; itemWait = 0; return; }
+                    if (++itemWait > 50) {                      // đứng cạnh mà chưa nhặt được (đầy túi / chờ delay) -> bỏ món này
+                        ignoreItems.add(it.getId());
+                        itemTarget = null;
+                        path = null;
+                    }
+                }
+            }
+            case R_PEARL -> {
+                release(mc);
+                if (deathDim != null && !deathDim.equals(lv.dimension())) { pearlDone = true; rec = R_WALK; path = null; return; }
+                double hd = Math.hypot(p.getX() - dc.x, p.getZ() - dc.z);
+                if (hd <= PEARL_STOP_DIST || pearlThrows >= PEARL_MAX_THROWS) {
+                    pearlDone = true;
+                    rec = R_WALK;
+                    recTimer = 0;
+                    path = null;
+                    return;
+                }
+                if (pearlTimer > 0) { pearlTimer--; return; }
+                int pi2 = AutoSandOrders.findItem(p, Items.ENDER_PEARL);
+                if (pi2 < 0) {                                  // chưa có ngọc -> mua
+                    if (pearlBuyFails >= 2) {
+                        AutoSandOrders.msg(p, "Không mua được ngọc Ender, đi bộ tới chỗ chết.");
+                        pearlDone = true;
+                        rec = R_WALK;
+                        path = null;
+                        return;
+                    }
+                    int need = (int) Math.min(PEARL_MAX_THROWS - pearlThrows, Math.ceil(hd / PEARL_RANGE));
+                    AutoSandOrders.beginPearlBuy(mc, p, Math.max(1, need));
+                    pearlTimer = 10;
+                    return;
+                }
+                if (p.getHealth() < PEARL_MIN_HP) {             // phải để ý máu: ngọc Ender gây 5 sát thương
+                    if (++pearlHpWait == 1) AutoSandOrders.msg(p, "Máu thấp (" + (int) p.getHealth() + "), chờ hồi máu rồi mới ném ngọc.");
+                    if (pearlHpWait > 600) {
+                        AutoSandOrders.msg(p, "Máu vẫn thấp sau 30 giây, đi bộ tới chỗ chết.");
+                        pearlDone = true;
+                        rec = R_WALK;
+                        path = null;
+                    }
+                    return;
+                }
+                pearlHpWait = 0;
+                switch (pearlStep) {
+                    case 0 -> {                                 // cầm ngọc + tính góc ném
+                        int slot = AutoSandOrders.toHotbar(mc, p, pi2);
+                        AutoSandOrders.setSelected(p, slot);
+                        Vec3 eye = p.getEyePosition();
+                        double dx = dc.x - eye.x, dz = dc.z - eye.z, d = Math.hypot(dx, dz);
+                        Vec3 aim = d <= PEARL_RANGE ? new Vec3(dc.x, dc.y, dc.z)
+                            : new Vec3(eye.x + dx / d * PEARL_RANGE, p.getY(), eye.z + dz / d * PEARL_RANGE);
+                        float[] ang = solvePearl(lv, p, aim);
+                        if (ang == null) {
+                            AutoSandOrders.msg(p, "Không tính được đường ném ngọc, đi bộ tới chỗ chết.");
+                            pearlDone = true;
+                            rec = R_WALK;
+                            path = null;
+                            return;
+                        }
+                        pearlYaw = ang[0];
+                        pearlPitch = ang[1];
+                        p.setYRot(pearlYaw);
+                        p.setXRot(pearlPitch);
+                        pearlStep = 1;
+                        pearlTimer = 4;
+                    }
+                    case 1 -> {                                 // ném
+                        p.setYRot(pearlYaw);
+                        p.setXRot(pearlPitch);
+                        mc.gameMode.useItem(p, InteractionHand.MAIN_HAND);
+                        p.swing(InteractionHand.MAIN_HAND);
+                        pearlThrows++;
+                        pearlStep = 0;
+                        pearlTimer = 60;                        // chờ ngọc bay, dịch chuyển và hết hồi chiêu
+                    }
+                    default -> pearlStep = 0;
+                }
+            }
+            case R_ORG -> {
+                release(mc);
+                if (--recTimer > 0) return;
+                if (recStep++ > 40) { endRecovery(mc, p, null); return; }
+                if (organize(mc, p)) recTimer = 4; else endRecovery(mc, p, null);
+            }
+            default -> rec = R_NONE;
+        }
+    }
+
+    static void toOrganize(Minecraft mc) {
+        release(mc);
+        rec = R_ORG;
+        recStep = 0;
+        recTimer = 5;
+        path = null;
+        itemTarget = null;
+    }
+
+    /** Không có đường: quay mặt về phía chỗ chết, đi thẳng và nhảy khi đụng vật cản. */
+    static void blindWalk(Minecraft mc, LocalPlayer p, Vec3 t) {
+        double dx = t.x - p.getX(), dz = t.z - p.getZ();
+        p.setYRot((float) Math.toDegrees(Math.atan2(-dx, dz)));
+        p.setXRot(0f);
+        mc.options.keyUp.setDown(true);
+        mc.options.keyJump.setDown(p.horizontalCollision && p.onGround());
+    }
+
+    static void endRecovery(Minecraft mc, LocalPlayer p, String why) {
+        rec = R_NONE;
+        deathRecorded = false;
+        deathMarker = false;
+        gotShovel = false;
+        release(mc);
+        path = null;
+        itemTarget = null;
+        target = null;
+        ph = P_IDLE;
+        scanCool = 0;
+        baseY = p.blockPosition().getY();
+        ignoreItems.clear();
+        AutoSandOrders.junkCool = 0;                           // dọn đồ + xếp thanh công cụ ngay
+        if (!hasAnyShovel(p)) {                                // chưa có xẻng thì chưa được đào
+            AutoSandOrders.msg(p, (why == null ? "Đã nhặt xong đồ" : "Dừng nhặt đồ: " + why) + " nhưng không có xẻng nào trong người. Tắt AutoSand.");
+            AutoSandOrders.setEnabled(mc, false);
+            return;
+        }
+        active = true;
+        AutoSandOrders.msg(p, (why == null ? "Đã nhặt xong đồ, xếp lại thanh công cụ." : "Dừng nhặt đồ: " + why + ".") + " Đào tiếp.");
+    }
+
+    // ----------------------------- XẾP LẠI THANH CÔNG CỤ -----------------------------
+    static int hotbarShovel(LocalPlayer p) {
+        for (int i = 0; i < 9; i++) {
+            if (p.getInventory().getItem(i).is(ItemTags.SHOVELS)) return i;
+        }
+        return -1;
+    }
+
+    /** Xẻng tốt nhất (còn nhiều độ bền nhất) trong túi (ô 9-35); -1 nếu không có. */
+    static int bestShovelInBackpack(LocalPlayer p) {
+        int best = -1;
+        double bp = -1;
+        for (int i = 9; i < 36; i++) {
+            ItemStack st = p.getInventory().getItem(i);
+            if (st.isEmpty() || !st.is(ItemTags.SHOVELS)) continue;
+            double pct = AutoSandOrders.remainingPct(st);
+            if (pct > bp) { bp = pct; best = i; }
+        }
+        return best;
+    }
+
+    /** Ô thanh công cụ xẻng từng nằm trước khi chết (mặc định ô đầu tiên). */
+    static int prefShovelSlot() {
+        for (int i = 0; i < 9; i++) {
+            if (snapShovel[i]) return i;
+        }
+        return 0;
+    }
+
+    static int freeHotbar(LocalPlayer p, int pref) {
+        if (p.getInventory().getItem(pref).isEmpty()) return pref;
+        for (int i = 0; i < 9; i++) {
+            if (p.getInventory().getItem(i).isEmpty()) return i;
+        }
+        return pref;
+    }
+
+    /** Mỗi lần gọi làm 1 thao tác; trả về true nếu còn việc phải làm tiếp. */
+    static boolean organize(Minecraft mc, LocalPlayer p) {
+        // 1) xẻng đang ở tay trái -> về thanh công cụ
+        if (p.getOffhandItem().is(ItemTags.SHOVELS)) {
+            AutoSandOrders.swapOffhand(mc, p, freeHotbar(p, 0));
+            return true;
+        }
+        // 2) xếp: ô1 xẻng, ô2 cà rốt vàng, ô3 cát, ô4-9 bình XP (đồ khác bị đẩy xuống túi và sẽ được vứt sau đó)
+        int[] mv = AutoSandOrders.arrangeMove(p);
+        if (mv != null) {
+            AutoSandOrders.swapHotbar(mc, p, mv[0], mv[1]);
+            return true;
+        }
+        if (hotbarShovel(p) < 0 && !shovelWarned) {
+            shovelWarned = true;
+            AutoSandOrders.msg(p, "Không tìm thấy xẻng nào để đặt lại thanh công cụ.");
+        }
+        // 3) cầm xẻng lên tay
+        int hs = hotbarShovel(p);
+        if (hs >= 0 && AutoSandOrders.getSelected(p) != hs) {
+            AutoSandOrders.setSelected(p, hs);
+            return true;
+        }
+        return false;
+    }
+
+    /** Có xẻng ở bất kỳ đâu trong người (thanh công cụ, túi, tay trái). */
+    static boolean hasAnyShovel(LocalPlayer p) {
+        if (p.getOffhandItem().is(ItemTags.SHOVELS)) return true;
+        for (int i = 0; i < 36; i++) {
+            if (p.getInventory().getItem(i).is(ItemTags.SHOVELS)) return true;
+        }
+        return false;
+    }
+
+    // ----------------------------- MŨI TÊN CHỈ ĐƯỜNG TỚI CHỖ CHẾT -----------------------------
+    static final String[] ARROWS = {"↑", "↗", "→", "↘", "↓", "↙", "←", "↖"};
+
+    /** Hiện mũi tên (trên thanh thông báo) chỉ hướng tới chỗ chết cho tới khi bạn tới nơi. */
+    static void arrowTick(Minecraft mc, LocalPlayer p) {
+        if (!deathMarker || deathPos == null || p.isDeadOrDying() || mc.level == null) return;
+        if (deathDim != null && !deathDim.equals(mc.level.dimension())) return;
+        if (++arrowCnt % 10 != 0) return;
+        double dx = deathPos.getX() + 0.5 - p.getX(), dz = deathPos.getZ() + 0.5 - p.getZ();
+        double hd = Math.hypot(dx, dz);
+        if (hd < 4.0 && Math.abs(p.getY() - deathPos.getY()) < 8.0) { deathMarker = false; return; }
+        double rel = Math.toDegrees(Math.atan2(-dx, dz)) - p.getYRot();
+        rel = ((rel + 180.0) % 360.0 + 360.0) % 360.0 - 180.0;
+        int idx = (int) Math.floorMod(Math.round(rel / 45.0), 8L);
+        mc.gui.setOverlayMessage(Component.literal(ARROWS[idx] + "  Chỗ chết: " + lastDeathText + "  -  còn " + (int) hd + " ô"), false);
+    }
+
+    // ----------------------------- NÉM NGỌC ENDER TỚI CHỖ CHẾT -----------------------------
+    static final double PEARL_SPEED = 1.5, PEARL_G = 0.03, PEARL_DRAG = 0.99;
+
+    /** Mô phỏng quỹ đạo ngọc; trả về {khoảng cách ngang tới điểm rơi, độ cao điểm rơi} hoặc null nếu không chạm khối nào. */
+    static double[] simPearl(ClientLevel lv, LocalPlayer p, Vec3 eye, float yaw, float pitch) {
+        double yr = Math.toRadians(yaw), pr = Math.toRadians(pitch), cp = Math.cos(pr);
+        double vx = -Math.sin(yr) * cp * PEARL_SPEED, vy = -Math.sin(pr) * PEARL_SPEED, vz = Math.cos(yr) * cp * PEARL_SPEED;
+        Vec3 pos = new Vec3(eye.x, eye.y - 0.1, eye.z);
+        for (int t = 0; t < 160; t++) {
+            Vec3 next = new Vec3(pos.x + vx, pos.y + vy, pos.z + vz);
+            BlockHitResult r = lv.clip(new ClipContext(pos, next, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, p));
+            if (r.getType() == HitResult.Type.BLOCK) {
+                Vec3 h = r.getLocation();
+                return new double[] {Math.hypot(h.x - eye.x, h.z - eye.z), h.y};
+            }
+            pos = next;
+            vx *= PEARL_DRAG;
+            vy = vy * PEARL_DRAG - PEARL_G;
+            vz *= PEARL_DRAG;
+            if (pos.y < -70) return null;
+        }
+        return null;
+    }
+
+    /** Tìm {yaw, pitch} để ngọc rơi gần điểm target nhất; null nếu không có góc nào đủ gần. Ưu tiên đường bay thấp. */
+    static float[] solvePearl(ClientLevel lv, LocalPlayer p, Vec3 target) {
+        Vec3 eye = p.getEyePosition();
+        double dx = target.x - eye.x, dz = target.z - eye.z, want = Math.hypot(dx, dz);
+        float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+        float best = Float.NaN;
+        double bestErr = 1e9;
+        for (float pitch = 10f; pitch >= -85f; pitch -= 0.5f) {
+            double[] r = simPearl(lv, p, eye, yaw, pitch);
+            if (r == null) continue;
+            double err = Math.abs(r[0] - want) + Math.abs(r[1] - target.y) * 0.2;
+            if (err < bestErr - 0.01) { bestErr = err; best = pitch; }
+        }
+        if (Float.isNaN(best) || bestErr > 6.0) return null;
+        return new float[] {yaw, best};
     }
 }
