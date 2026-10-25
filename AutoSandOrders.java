@@ -99,8 +99,6 @@ import java.util.function.Predicate;
  * 12) Chết: đứng yên 10 giây sau /home, mũi tên chỉ đường tới chỗ chết, có thể ném ngọc Ender tới chỗ chết (xem AutoMiner).
  * 13) Thanh công cụ cố định: ô1 xẻng, ô2 cà rốt vàng, ô3 cát, ô4-9 bình XP; đồ khác tự vứt. Tab "Thống kê" trong GUI.
  *
- * Key:    50 key ngắn (8 ký tự) vĩnh viễn có sẵn trong mod (xem class License). /autosand key <key> | status
- *
  * Lệnh:  /autosand            mở bảng GUI tuỳ chỉnh
  *        /autosand toggle     bật / tắt nhanh
  *        /autosand cmd <lệnh> đổi lệnh mở orders (không có dấu /)
@@ -201,7 +199,6 @@ public class AutoSandOrders implements ClientModInitializer {
     static boolean settle = false;
     static LocalPlayer lastPlayer = null;
     static int reviveIn = 0;
-    static int licTick = 0;
     static boolean buyFood = false, foodWarn = false;            // đang mua đồ ăn (thay vì bình XP)
     static int foodBuyFails = 0, junkCool = 0, junkStep = 0, junkDropped = 0, eatPrevSlot = -1;
     static float eatXRot = Float.NaN, junkXRot = Float.NaN;
@@ -216,7 +213,6 @@ public class AutoSandOrders implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         load();
-        License.init(FabricLoader.getInstance().getConfigDir());
         ClientTickEvents.END_CLIENT_TICK.register(AutoSandOrders::tick);
         registerMenuKey();
 
@@ -241,17 +237,6 @@ public class AutoSandOrders implements ClientModInitializer {
                             ctx.getSource().sendFeedback(Component.literal("[AutoSand] Lệnh orders: /" + ORDER_COMMAND));
                             return 1;
                         })))
-                .then(ClientCommandManager.literal("key")
-                    .then(ClientCommandManager.argument("key", StringArgumentType.greedyString())
-                        .executes(ctx -> {
-                            activateKey(Minecraft.getInstance(), StringArgumentType.getString(ctx, "key"));
-                            return 1;
-                        })))
-                .then(ClientCommandManager.literal("status")
-                    .executes(ctx -> {
-                        ctx.getSource().sendFeedback(Component.literal("[AutoSand] Key: " + License.status()));
-                        return 1;
-                    }))
                 .then(ClientCommandManager.literal("shop")
                     .then(ClientCommandManager.argument("text", StringArgumentType.greedyString())
                         .executes(ctx -> {
@@ -448,10 +433,6 @@ public class AutoSandOrders implements ClientModInitializer {
     static void setEnabled(Minecraft mc, boolean on) {
         if (on == enabled) return;
         LocalPlayer p = mc.player;
-        if (on && !License.valid()) {                    // phải có key còn hạn mới bật được
-            if (p != null) needKeyMsg(p);
-            return;
-        }
         enabled = on;
         nukerState = null;
         Lobby.reset();
@@ -478,7 +459,6 @@ public class AutoSandOrders implements ClientModInitializer {
 
     // ----------------------------- ĐIỀU KHIỂN ĐÀO -----------------------------
     static void startMining(LocalPlayer p) {
-        if (!License.valid()) return;
         if (useNuker) setNuker(p, true);                                // luôn tự bật Nuker khi bắt đầu đào
         if (mode == Mode.BUILTIN) { AutoMiner.start(p); return; }      // tự đào: không cần Baritone
         if (mode == Mode.BARITONE) send(p, BARITONE_MINE);
@@ -543,17 +523,6 @@ public class AutoSandOrders implements ClientModInitializer {
         if (reviveIn > 0 && --reviveIn == 0) { applyBaritoneSettings(p); startMining(p); }
         if (++statTicks % 1200 == 0) save();                 // thời gian treo (tính cả lúc lưu thống kê mỗi phút)
 
-        if (++licTick >= 20) {                           // mỗi ~1 giây kiểm tra lại key
-            licTick = 0;
-            if (!License.valid()) {
-                msg(p, "Key hết hạn hoặc không hợp lệ -> đã tắt AutoSand.");
-                needKeyMsg(p);
-                setEnabled(mc, false);
-                return;
-            }
-        }
-        // Chốt chặn thứ 2, lệch pha với chốt trên: bypass 1 chỗ vẫn bị chặn ở chỗ còn lại.
-        if (!License.quickCheck()) { setEnabled(mc, false); return; }
         if (Lobby.tick(mc, p)) return;                       // bị kick ra sảnh -> tự quay lại KingSMP
 
         if (state == S.MINING && mc.screen == null && guardTick(mc, p)) return;   // an toàn: nước / lava / hố
@@ -583,7 +552,7 @@ public class AutoSandOrders implements ClientModInitializer {
             if (cooldown > 0) { cooldown--; return; }
 
             // 1) vứt đồ rác (không phải cát / bình XP / xẻng / đồ ăn)
-            if (autoDrop && junkCool <= 0 && (junkSlot(p) >= 0 || arrangeMove(p) != null)) {
+            if (junkCool <= 0 && ((autoDrop && junkSlot(p) >= 0) || arrangeMove(p) != null)) {
                 startJunk(mc, p);
                 return;
             }
@@ -669,7 +638,6 @@ public class AutoSandOrders implements ClientModInitializer {
                 wait = ACTION_DELAY;
             }
             case DEPOSIT -> {
-                if (!License.quickCheck()) { abort(mc, "key không hợp lệ"); return; }
                 if (h == null || h.containerId != lastSync) {
                     // bảng giao hàng biến mất: đã giao được cát thì sang bước xác nhận, chưa thì thử đơn khác
                     if (sandMoved(p)) {
@@ -992,7 +960,7 @@ public class AutoSandOrders implements ClientModInitializer {
                     wait = 3;
                     return;
                 }
-                int j = junkSlot(p);
+                int j = autoDrop ? junkSlot(p) : -1;
                 if (j >= 0 && junkDropped < JUNK_MAX_DROPS) {
                     dropStack(mc, p, j);
                     junkDropped++;
@@ -1256,7 +1224,7 @@ public class AutoSandOrders implements ClientModInitializer {
     static int nwTick = 0;
 
     static void setNuker(LocalPlayer p, boolean on) {
-        if (on && nukerWater) on = false;
+        if (on && (nukerWater || AutoMiner.recovering())) on = false;   // gần nước / đang đi nhặt đồ: không bật Nuker
         if (nukerState != null && nukerState == on) return;
         nukerState = on;
         send(p, on ? NUKER_ON : NUKER_OFF);
@@ -1587,14 +1555,6 @@ public class AutoSandOrders implements ClientModInitializer {
         else p.connection.sendChat(s);
     }
 
-    static void activateKey(Minecraft mc, String key) {
-        if (mc.player != null) msg(mc.player, License.activate(key));
-    }
-
-    static void needKeyMsg(LocalPlayer p) {
-        msg(p, "Cần key để dùng. Nhắn Zalo " + License.ZALO + " để mua key. Có key thì gõ /autosand key <key>.");
-    }
-
     static void msg(LocalPlayer p, String t) {
         p.displayClientMessage(Component.literal("[AutoSand] " + t), false);
     }
@@ -1765,143 +1725,9 @@ public class AutoSandOrders implements ClientModInitializer {
                 AutoMiner.recTimer = 60;
                 AutoMiner.homeTries = 0;
                 AutoMiner.teleported = false;
+                AutoMiner.kitStep = 2;
             }
             msg(p, "Đã quay lại KingSMP, đào tiếp.");
-        }
-    }
-
-    // ============================== HỆ THỐNG KEY (LICENSE) ==============================
-    /**
-     * 50 key NGẮN (8 ký tự) VĨNH VIỄN có sẵn trong mod, dùng được trên mọi máy, không cần Internet.
-     * Trong mod chỉ lưu mã băm SHA-256 của key (không lưu key gốc), nên mở file mod ra cũng không đọc được key.
-     * Danh sách key gốc nằm trong file autosand_keys.txt (chỉ bạn giữ, đừng đưa vào mod).
-     * Khách gõ /autosand key <key> (hoặc copy key rồi bấm "Kích hoạt key từ clipboard" trong /autosand).
-     */
-    static final class License {
-        private License() { }
-
-        private static final byte[] ZALO_ENC = {85, 86, 92, 82, 83, 80, 82, 87, 80, 85}; // XOR("0397657250", 0x65)
-        public static final String ZALO = deobf(ZALO_ENC);
-
-        private static String deobf(byte[] enc) {
-            char[] c = new char[enc.length];
-            for (int i = 0; i < enc.length; i++) c[i] = (char) (enc[i] ^ 0x65);
-            return new String(c);
-        }
-
-        private static final String SALT = "AutoSand/key/v3|";
-        private static final int KEY_LEN = 8;
-        private static final String[] KEY_HASHES = {
-            "fe74adceb220ea043e417d5e74a7627954066e91e60c99f5bb893dd945311b53",
-            "96f6f9762214befd2bda48168113aa2f9abfb7446a1c389cc90cc33bd58d0dd5",
-            "afd6482fe2285e2f83872337d3a5c262dc6f99fdb08b273e6ea1bb90af295636",
-            "46edd9659dbdb2f6937918bdc8fb358b16b5f6035ae59cd2725f8d0c794788cc",
-            "c3b5e893e247811530f07f45b463f0d6c918a29fb249edf87ca9d861e1c60e8c",
-            "640d204b6c758a1bf0c69aee5e6aba5e0bc448183c761f533fc8015dad1e3a3a",
-            "b170bfe1c403db3e940ea57b4dc20994b973f786ad5874c99e0ad8179adcca2d",
-            "8cfd899892d83c1729a5fe58280434e91a58ff77594f36311f7bd756433b09ea",
-            "f783dc15f1cad16656f3728a6b5b93edba97a5d22034e934a7f59ac7e6b1e27e",
-            "0ff818aabb23dc38d8c94fd5886e7acb16dd108e1f686c60f98f59a9002f1939",
-            "3193c07d6144e65b23d833b19e9af123fe4293ec1f0638c33603e2dbe7637cae",
-            "730fc96ba2d900d62eec2ed353ee44bcda0c4f0e4adbf865d96ed1f50cb78b2b",
-            "4c70f1e6cf6ad460491ac71c0851e134b62da5c11cfa1bf1ddc365f43598637e",
-            "6dd4c56964dbf5d6cca212fcc62ef53e1d3c8e4b18ead089b00006dcadaccaa6",
-            "a97d2ddd99b3c8c2d81d3964c94ec2341190312f970ecd6d1828bb4cdf528bda",
-            "03b00732a898b80bd0f14335b66157569794a82efc533b78b6a0b8121c5b322d",
-            "74cc715b9645279891bf1870989e12e25b34b27f0e5cd708d9228075e21d737f",
-            "45001e801d4504284d307b7a0603aee2a61f3d8490e6be679e9f6a1ddb3ba3d3",
-            "bc9505ec442f3db2b4df4bf2acf5a3b296b6f43ccaf942942402968366df3871",
-            "1526a6978bb9267f5c5ea3b26cac81120a8de10d5c20cefebd3f9edc5788beb0",
-            "50e965e781695f348604ca8f327912e8d9804e01213430ee8a8b151aca2e96d2",
-            "c6db9bc77920c8358fead4b800db27a41d5b95809cbc7f075cf6144045fd4fe5",
-            "67928ad882fdfca7129f3d712c1b1c093e6eb5d1a7ad04aaebed7c3827563c68",
-            "0a6248d926af9511915217500806dbb0e701ea7378304a2dd98716dea0ee5b21",
-            "75762f8a44596ae941b9afacaaa5e58ff555ccc769e93c4c8cf0f8b672810df5",
-            "defc3dd1522ea3a957dd88ed7d39df2c88283e212b4b5e3db012cffbc4c2e325",
-            "f66b50d4522a65e0dd5ad2e7eda24050085e6e5e83ade7385545b2831e47cdc4",
-            "e63ff59ab779a987828472b13312cf1ad36e84122e569f43c2769d6a6ca03d15",
-            "42dd2f343183254392d610bf207134ec57885148c30664aa477e478a96e703df",
-            "135808bce3484c84605dbc69b33449788bf45c2c079547097710da74356c6a57",
-            "41dd5a1d96185923ddecc833017f19b326a44719b22ef4439ca6e0bad7d280e7",
-            "6a663ab9f1d07a12e2a40e97d16de6d1ba69ffc2e6aa42205926fc93ca143644",
-            "a74883890845eff9298d88652e8aaf89bc6605e4fea3d6ca83581c9ecc0903ca",
-            "20039b758fa7e861b6dd065e8fffb964edb62a74a53d5529079819340990c657",
-            "7517ab368388276084bcf016c1cc57f0e29984b98a751e60e0f68c4a4c939861",
-            "f17cdb79f4f9744e69d25953234adc18c0f8506318a56d75b0b320dcdf984af0",
-            "5962ff95e4f7396262cb1834264404325bd9d70986a05ed6c9002810f9ef0050",
-            "3c3fd873c664082a3be82131dd6765e8b4b113df666e93bd5549df0ee34b4856",
-            "02adc2e142c644cde4ad6ae1cddcc9db72ece8a7e2de86097393db9d88857228",
-            "a751a22d96033d1ed38f5c63f4cb1092735a17c08e2a1bce4d1ee6e077ca7a68",
-            "5950e4091107b7b98417be31e310e7c182ae92f9be603a38adc8c468902be972",
-            "f3dfd3dcbab2b7a694a834790fb604322f77a8238c211911f7279da3d0a6f394",
-            "b64f983f7d3cf73e7351ac17564175f2e7791ed52dde04a62e00c7c5b080323b",
-            "2d0065576eb1272a9dfd7a6a07ffd7d0844e6a41b6ff8170974feaf57e696757",
-            "a49bb1637963a95bd8adbde19c41c47a019ec21d5e90f8ec22610073d595c310",
-            "293a33f75ea4546784ba24c7b67060d24ce3d87b8dfdaf1409f98a145faad0a2",
-            "6ba7b772674c240d6d25b6f1385635f45199dab52c7187c2351cabc450b0f5b2",
-            "c72795bd0814d5f037a2c43b3ef02599644b1acad44a2b88c0c82bfc3ff4b87c",
-            "baba66b6aac6de729b01dd31c29e2323bd3bf1151acfd54c26f8ee80df98c89a",
-            "ced49ab6d2664baa5ec6e615310b0b8d90ae7ffd4df4ecb7a68b4f3e666af95e"
-        };
-
-        private static Path file;
-        private static volatile String storedKey = null;
-        private static volatile boolean ok = false;
-
-        public static void init(Path configDir) {
-            file = configDir.resolve("autosand.lic");
-            storedKey = null;
-            try {
-                if (Files.exists(file)) {
-                    List<String> l = Files.readAllLines(file, StandardCharsets.UTF_8);
-                    if (!l.isEmpty()) storedKey = l.get(0).trim();
-                }
-            } catch (Exception ignored) { }
-            String k = storedKey;
-            ok = k != null && matches(k);
-        }
-
-        /** Viết hoa, bỏ dấu gạch và khoảng trắng: "ab12-cd34" -> "AB12CD34". */
-        private static String normalize(String key) {
-            return key == null ? "" : key.toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9]", "");
-        }
-
-        private static boolean matches(String key) {
-            String n = normalize(key);
-            if (n.length() != KEY_LEN) return false;
-            try {
-                byte[] d = MessageDigest.getInstance("SHA-256").digest((SALT + n).getBytes(StandardCharsets.UTF_8));
-                String hex = HexFormat.of().formatHex(d);
-                for (String h : KEY_HASHES) {
-                    if (h.equals(hex)) return true;
-                }
-            } catch (Exception ignored) { }
-            return false;
-        }
-
-        /** Key đã kích hoạt (kết quả lưu sẵn). */
-        public static boolean valid() {
-            return ok;
-        }
-
-        /** Kiểm tra lại độc lập với valid(): tính lại mã băm của key đang lưu. */
-        public static boolean quickCheck() {
-            String k = storedKey;
-            return k != null && matches(k);
-        }
-
-        public static String status() {
-            return ok ? "đã kích hoạt (vĩnh viễn)" : "chưa kích hoạt";
-        }
-
-        public static String activate(String key) {
-            if (!matches(key)) return "Key không đúng. Nhắn Zalo " + ZALO + " để mua key.";
-            storedKey = normalize(key);
-            ok = true;
-            try {
-                if (file != null) Files.write(file, List.of(storedKey), StandardCharsets.UTF_8);
-            } catch (Exception ignored) { }
-            return "Kích hoạt thành công: key vĩnh viễn.";
         }
     }
 
@@ -2611,8 +2437,8 @@ public class AutoSandOrders implements ClientModInitializer {
 
     static class AutoSandScreen extends Screen {
         static final int PW = 392, SIDE = 94;
-        static final String[] TABS = {"Chính", "Đào cát", "Sinh tồn", "An toàn", "Key", "Tự đào", "Thống kê"};
-        static final int[] TAB_COL = {0xFF3B82F6, 0xFFF59E0B, 0xFF22C55E, 0xFFEF4444, 0xFFA855F7, 0xFF14B8A6, 0xFFEC4899};
+        static final String[] TABS = {"Chính", "Đào cát", "Sinh tồn", "An toàn", "Tự đào", "Thống kê"};
+        static final int[] TAB_COL = {0xFF3B82F6, 0xFFF59E0B, 0xFF22C55E, 0xFFEF4444, 0xFF14B8A6, 0xFFEC4899};
         static final int TXT = 0xFFFFFFFF, MUTED = 0xFF8A94A6;
 
         /** Một điều khiển tự vẽ (nút thật của game nằm bên dưới, trong suốt, chỉ để nhận chuột). */
@@ -2734,7 +2560,7 @@ public class AutoSandOrders implements ClientModInitializer {
                     toggle(1, "Bắc cầu qua nước", "Bị nước bao quanh -> đặt block đi vào bờ", () -> bridgeWater, v -> bridgeWater = v);
                     toggle(2, "Né hố & tự leo", "Rơi xuống hố -> tự đặt block leo lên", () -> avoidHole, v -> avoidHole = v);
                 }
-                case 5 -> {
+                case 4 -> {
                     begin(6);
                     toggle(0, "Chết -> về nhặt đồ", "Hồi sinh -> /home -> về chỗ chết nhặt lại đồ", () -> AutoMiner.deathRecover, v -> AutoMiner.deathRecover = v);
                     toggle(1, "Tự hồi sinh", "Chết thì tự bấm nút Hồi sinh", () -> AutoMiner.autoRespawn, v -> AutoMiner.autoRespawn = v);
@@ -2749,7 +2575,7 @@ public class AutoSandOrders implements ClientModInitializer {
                     toggle(4, "Bị kick -> về KingSMP", "Ra sảnh: bấm la bàn chọn KingSMP, đào tiếp", () -> autoRejoin, v -> autoRejoin = v);
                     toggle(5, "Dùng ngọc Ender", "Chết xa: mua ngọc ở /shop, ném tới chỗ chết", () -> usePearl, v -> usePearl = v);
                 }
-                case 6 -> {
+                case 5 -> {
                     Ctl c1 = add(1, cx, cy + 124, cw, 24, "Giá ước tính mỗi cát", null, () -> {
                         double next = PRICE_LEVELS[0];
                         for (double v : PRICE_LEVELS) {
@@ -2766,10 +2592,6 @@ public class AutoSandOrders implements ClientModInitializer {
                         save();
                     });
                 }
-                default -> add(2, cx, cy + 40, cw, 28, "Dán key từ clipboard", null, () -> {
-                    Minecraft mc = Minecraft.getInstance();
-                    activateKey(mc, mc.keyboardHandler.getClipboard());
-                });
             }
         }
 
@@ -2847,9 +2669,6 @@ public class AutoSandOrders implements ClientModInitializer {
                 } else {
                     g.drawString(this.font, "Chưa vào thế giới.", cx + 4, cy + 80, MUTED, false);
                 }
-                rrect(g, cx, cy + 152, cw, 24, 4, 0xFF252F45);
-                rrect(g, cx + 1, cy + 153, cw - 2, 22, 3, 0xFF182032);
-                g.drawString(this.font, "Key: " + License.status(), cx + 9, cy + 160, License.valid() ? 0xFF22C55E : 0xFFEF4444, false);
             } else if (tab == 3) {
                 int iy = cardY(3) + 6;
                 rrect(g, cx, iy, cw, 66, 4, 0xFF252F45);
@@ -2858,24 +2677,13 @@ public class AutoSandOrders implements ClientModInitializer {
                 bullet(g, "Bị nước bao quanh: đặt cát bắc cầu vào bờ.", cx + 10, iy + 22);
                 bullet(g, "Rơi xuống hố: nhảy + đặt cát để leo, không đào lên.", cx + 10, iy + 36);
                 bullet(g, "Né nước/hố phía trước: chỉ ở chế độ ngoài Baritone.", cx + 10, iy + 50);
-            } else if (tab == 6) {
+            } else if (tab == 5) {
                 int sw = (cw - 4) / 2;
                 stat(g, cx, cy, cw, 36, "Toạ độ chết gần nhất", AutoMiner.lastDeathText == null ? "Chưa chết lần nào" : AutoMiner.lastDeathText, TXT, -1f, 0);
                 stat(g, cx, cy + 40, sw, 36, "Thời gian treo", fmtTime(statTicks), TXT, -1f, 0);
                 stat(g, cx + sw + 4, cy + 40, sw, 36, "Tổng tiền kiếm được", fmtMoney(), 0xFF22C55E, -1f, 0);
                 stat(g, cx, cy + 80, sw, 36, "Cát đã giao", String.valueOf(statSand), TXT, -1f, 0);
                 stat(g, cx + sw + 4, cy + 80, sw, 36, "Số lần chết", String.valueOf(statDeaths), 0xFFEF4444, -1f, 0);
-            } else if (tab == 4) {
-                rrect(g, cx, cy, cw, 32, 4, 0xFF252F45);
-                rrect(g, cx + 1, cy + 1, cw - 2, 30, 3, 0xFF182032);
-                g.drawString(this.font, "Trạng thái key", cx + 9, cy + 5, MUTED, false);
-                g.drawString(this.font, License.status(), cx + 9, cy + 18, License.valid() ? 0xFF22C55E : 0xFFEF4444, false);
-                int iy = cy + 76;
-                rrect(g, cx, iy, cw, 60, 4, 0xFF252F45);
-                rrect(g, cx + 1, iy + 1, cw - 2, 58, 3, 0xFF182032);
-                bullet(g, "Copy key rồi bấm nút phía trên.", cx + 10, iy + 8);
-                bullet(g, "Hoặc gõ lệnh: /autosand key <key>", cx + 10, iy + 22);
-                bullet(g, "Mua key: Zalo " + License.ZALO, cx + 10, iy + 36);
             }
 
             // ----- vẽ các điều khiển -----
@@ -3033,6 +2841,8 @@ final class AutoMiner {
     static Vec3 homeFrom = null, itemPlanPos = null;
     static String lastDeathText = null;
     static float pearlYaw = 0f, pearlPitch = 0f;
+    static int kitStep = 2, kitDropped = 0;     // vứt đồ kit hồi sinh: 0 chưa làm, 1 đang vứt, 2 xong / bỏ qua
+    static float kitXRot = Float.NaN;
     static boolean deathMarker = false;       // đang hiện mũi tên chỉ đường tới chỗ chết
     static boolean gotShovel = false;         // đã nhặt lại được xẻng trong lần nhặt đồ này
     static boolean teleported = false, canDig = false, pearlDone = false;
@@ -3063,6 +2873,7 @@ final class AutoMiner {
 
     /** Tắt hẳn (người dùng bấm TẮT / BẬT): xoá luôn việc đang nhặt đồ. */
     static void reset(Minecraft mc) {
+        orgDone = false;
         stop(mc);
         rec = R_NONE;
         deathRecorded = false;
@@ -3126,6 +2937,9 @@ final class AutoMiner {
             pearlDone = false;
             pearlBuyFails = 0;
             teleported = false;
+            kitStep = 0;
+            kitDropped = 0;
+            orgDone = false;
             ignoreItems.clear();
             AutoSandOrders.msg(p, "Đã hồi sinh. Chuẩn bị /" + homeCmd + ", đứng yên 10 giây rồi mới đi tiếp.");
         } else {
@@ -3154,8 +2968,13 @@ final class AutoMiner {
         ClientLevel lv = mc.level;
         if (lv == null) return;
         canDig = digThrough && hotbarShovel(p) >= 0;          // không có xẻng thì không đào xuyên, đi vòng
-        if (rec != R_NONE) { tickRecovery(mc, p, lv); return; }
+        if (rec != R_NONE) {                                   // đang đi nhặt đồ sau khi chết: tắt Nuker
+            if (AutoSandOrders.useNuker) AutoSandOrders.setNuker(p, false);
+            tickRecovery(mc, p, lv);
+            return;
+        }
         if (!active) return;
+        fixShovel(mc, p);                                       // xẻng đang nằm trong túi / tay trái -> đưa lên thanh công cụ
         if (waterRetreat(mc, p, lv)) return;                   // nước sát người -> lùi ra xa
         phTicks++;
         if (scanCool > 0) scanCool--;
@@ -3739,16 +3558,18 @@ final class AutoMiner {
     }
 
     static void tickRecovery(Minecraft mc, LocalPlayer p, ClientLevel lv) {
-        if (deathPos == null || ++recTicks > RECOVER_TIMEOUT) {
+        if (deathPos == null || (rec != R_ORG && ++recTicks > RECOVER_TIMEOUT)) {
             endRecovery(mc, p, "quá thời gian, bỏ qua");
             return;
         }
         if (hasAnyShovel(p)) gotShovel = true;
+        if (rec != R_ORG && rec != R_WAIT) fixShovel(mc, p);       // nhặt được xẻng là đưa lên thanh công cụ ngay
         Vec3 dc = deathCenter();
         switch (rec) {
             case R_WAIT -> {
                 release(mc);
                 if (--recTimer > 0) return;
+                if (kitDrop(mc, p)) { recTimer = 3; return; }        // vứt giáp / cúp / kiếm / bánh mì rồi mới /home
                 if (homeCmd == null || homeCmd.isBlank()) { rec = deathRecover ? R_WALK : R_HOME; recTimer = deathRecover ? 0 : HOME_STILL; path = null; return; }
                 homeFrom = p.position();
                 teleported = false;
@@ -3832,14 +3653,14 @@ final class AutoMiner {
                 else if (r == DONE) path = null;
             }
             case R_COLLECT -> {
-                if (++collectTicks > 2400) { toOrganize(mc); return; }
+                if (++collectTicks > 2400) { orgWhy = null; toOrganize(mc); return; }
                 if (itemTarget == null || itemTarget.isRemoved()) {
-                    itemTarget = findDrop(lv, p, dc, COLLECT_R, false);
+                    itemTarget = findDrop(lv, p, dc, hasAnyShovel(p) ? COLLECT_R : 24, false);
                     path = null;
                     itemWait = 0;
                     if (itemTarget == null) {
                         release(mc);
-                        if (++collectIdle >= 60) toOrganize(mc);
+                        if (++collectIdle >= (hasAnyShovel(p) ? 60 : 200)) { orgWhy = null; toOrganize(mc); }
                         return;
                     }
                     collectIdle = 0;
@@ -3947,14 +3768,15 @@ final class AutoMiner {
             case R_ORG -> {
                 release(mc);
                 if (--recTimer > 0) return;
-                if (recStep++ > 40) { endRecovery(mc, p, null); return; }
-                if (organize(mc, p)) recTimer = 4; else endRecovery(mc, p, null);
+                if (recStep++ > 40) { endRecovery(mc, p, orgWhy); return; }
+                if (organize(mc, p)) recTimer = 4; else endRecovery(mc, p, orgWhy);
             }
             default -> rec = R_NONE;
         }
     }
 
     static void toOrganize(Minecraft mc) {
+        orgDone = true;
         release(mc);
         rec = R_ORG;
         recStep = 0;
@@ -3972,7 +3794,17 @@ final class AutoMiner {
         mc.options.keyJump.setDown(p.horizontalCollision && p.onGround());
     }
 
+    static boolean orgDone = false;
+    static String orgWhy = null;
+
     static void endRecovery(Minecraft mc, LocalPlayer p, String why) {
+        if (!orgDone) {                                        // chưa xếp đồ: xếp xẻng / cà rốt / cát / bình XP trước rồi mới kết thúc
+            orgDone = true;
+            orgWhy = why;
+            toOrganize(mc);
+            return;
+        }
+        orgDone = false;
         rec = R_NONE;
         deathRecorded = false;
         deathMarker = false;
@@ -3992,6 +3824,7 @@ final class AutoMiner {
             return;
         }
         active = true;
+        if (AutoSandOrders.useNuker) AutoSandOrders.setNuker(p, true);   // đã có xẻng -> bật lại Nuker rồi đào tiếp
         AutoSandOrders.msg(p, (why == null ? "Đã nhặt xong đồ, xếp lại thanh công cụ." : "Dừng nhặt đồ: " + why + ".") + " Đào tiếp.");
     }
 
@@ -4056,6 +3889,64 @@ final class AutoMiner {
             return true;
         }
         return false;
+    }
+
+    // ----------------------------- VỨT ĐỒ KIT SAU KHI HỒI SINH -----------------------------
+    /** Đồ phát khi hồi sinh cần vứt: giáp, cúp, kiếm, bánh mì (xẻng thì giữ). */
+    static boolean isKit(ItemStack st) {
+        if (st.isEmpty() || st.is(ItemTags.SHOVELS)) return false;
+        return st.is(ItemTags.PICKAXES) || st.is(ItemTags.SWORDS) || st.is(Items.BREAD)
+            || st.is(ItemTags.HEAD_ARMOR) || st.is(ItemTags.CHEST_ARMOR)
+            || st.is(ItemTags.LEG_ARMOR) || st.is(ItemTags.FOOT_ARMOR);
+    }
+
+    /** Ô (theo menu túi đồ) đầu tiên chứa đồ kit: giáp đang mặc (5-8), túi + thanh công cụ, tay trái (45); -1 nếu hết. */
+    static int kitSlot(LocalPlayer p) {
+        for (int i = 5; i <= 8; i++) {
+            if (!p.inventoryMenu.getSlot(i).getItem().isEmpty()) return i;
+        }
+        for (int i = 0; i < 36; i++) {
+            if (isKit(p.getInventory().getItem(i))) return AutoSandOrders.menuSlot(i);
+        }
+        if (isKit(p.getOffhandItem())) return 45;
+        return -1;
+    }
+
+    /** Mỗi lần vứt 1 món. Trả về true nếu còn đang vứt (chưa được gửi /home). */
+    static boolean kitDrop(Minecraft mc, LocalPlayer p) {
+        if (kitStep >= 2) return false;
+        int slot = kitSlot(p);
+        if (kitStep == 0) {
+            if (slot < 0) { kitStep = 2; return false; }
+            kitXRot = p.getXRot();
+            p.setXRot(0f);                                     // nhìn ngang để đồ văng xa, không bị nhặt lại
+            kitStep = 1;
+            return true;
+        }
+        if (slot >= 0 && kitDropped < 40) {
+            mc.gameMode.handleInventoryMouseClick(p.inventoryMenu.containerId, slot, 1, ClickType.THROW, p);
+            kitDropped++;
+            return true;
+        }
+        if (!Float.isNaN(kitXRot)) { p.setXRot(kitXRot); kitXRot = Float.NaN; }
+        kitStep = 2;
+        AutoSandOrders.msg(p, "Đã vứt " + kitDropped + " món (giáp, cúp, kiếm, bánh mì) trước khi về home.");
+        return false;
+    }
+
+    static int fixCool = 0;
+
+    /** Mỗi ~1 giây: thanh công cụ chưa có xẻng mà trong người có -> chuyển lên (ưu tiên ô trống, ô 1). */
+    static void fixShovel(Minecraft mc, LocalPlayer p) {
+        if (++fixCool < 20) return;
+        fixCool = 0;
+        if (hotbarShovel(p) >= 0) return;
+        if (p.getOffhandItem().is(ItemTags.SHOVELS)) {
+            AutoSandOrders.swapOffhand(mc, p, freeHotbar(p, 0));
+            return;
+        }
+        int idx = bestShovelInBackpack(p);
+        if (idx >= 9) AutoSandOrders.swapHotbar(mc, p, idx, freeHotbar(p, 0));
     }
 
     /** Có xẻng ở bất kỳ đâu trong người (thanh công cụ, túi, tay trái). */
